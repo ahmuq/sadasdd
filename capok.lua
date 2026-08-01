@@ -14,8 +14,6 @@ local GuiService          = game:GetService("GuiService")
 --                                 DEV FLAGS                                   --
 -- ========================================================================= --
 local DEBUG_TAB_ENABLED   = true -- set to false before publishing
-local AR_DEBUG            = false
-local AR_DEBUG_TIMELINE   = {}
 
 -- ========================================================================= --
 --                                  REMOTES                                   --
@@ -76,6 +74,7 @@ local AutoParry            = {
     FallbackBlockDuration = 0.45,
     FallbackBlockRange = 12,
     LastFallbackBlock = 0,
+    FaceLockConn = nil,
 }
 
 local PERFECT_PARRY_CONFIG = {
@@ -148,11 +147,10 @@ local function isAnyAutoParryEnabled()
 end
 
 -- ── Mobile detection: auto-compensate for lower FPS / scheduler jitter ── --
-local IsMobileDevice = UserInputService.TouchEnabled
-    and not UserInputService.MouseEnabled
-    and not UserInputService.KeyboardEnabled
 -- Extra lead (seconds) added on mobile to counter task.delay granularity
-local MOBILE_EXTRA_LEAD = IsMobileDevice and 0.04 or 0
+local MOBILE_EXTRA_LEAD = (UserInputService.TouchEnabled
+    and not UserInputService.MouseEnabled
+    and not UserInputService.KeyboardEnabled) and 0.04 or 0
 
 local function getNetworkOneWayTime()
     local now = os.clock()
@@ -186,13 +184,17 @@ end
 -- ========================================================================= --
 --                               PARRY FUNCTION                               --
 -- ========================================================================= --
-local DEBUG_EVENTS       = false
-local DEBUG_COPY_KEY     = Enum.KeyCode.F8
-local DebugTimeline      = {}
-local DebugStartedAt     = os.clock()
-local STUN_DEBUG_EVENTS  = false
-local StunDebugTimeline  = {}
-local StunDebugStartedAt = os.clock()
+local Dbg = {
+    Events = false,
+    CopyKey = Enum.KeyCode.F8,
+    Timeline = {},
+    StartedAt = os.clock(),
+    StunEvents = false,
+    StunTimeline = {},
+    StunStartedAt = os.clock(),
+    ArDebug = false,
+    ArTimeline = {},
+}
 
 local function debugLog(...)
     local values = { ... }
@@ -200,11 +202,11 @@ local function debugLog(...)
         values[index] = tostring(value)
     end
 
-    local line = string.format("+%.6f | %s", os.clock() - DebugStartedAt,
+    local line = string.format("+%.6f | %s", os.clock() - Dbg.StartedAt,
         table.concat(values, " "))
-    table.insert(DebugTimeline, line)
-    if #DebugTimeline > 1500 then
-        table.remove(DebugTimeline, 1)
+    table.insert(Dbg.Timeline, line)
+    if #Dbg.Timeline > 1500 then
+        table.remove(Dbg.Timeline, 1)
     end
     print(line)
 end
@@ -222,7 +224,7 @@ local function getAutoParryDebugOutput()
         "ParryAttempts: " .. tostring(AutoParry.TotalParries),
         "--- TIMELINE ---",
     }, "\n")
-    return header .. "\n" .. table.concat(DebugTimeline, "\n")
+    return header .. "\n" .. table.concat(Dbg.Timeline, "\n")
 end
 
 local function stunDebugValue(value, depth)
@@ -246,15 +248,15 @@ local function stunDebugValue(value, depth)
 end
 
 local function stunDebugLog(tag, ...)
-    if not STUN_DEBUG_EVENTS then return end
+    if not Dbg.StunEvents then return end
     local values = { ... }
     for index, value in ipairs(values) do
         values[index] = stunDebugValue(value)
     end
     local line = string.format("+%.6f | [STUN %s] %s",
-        os.clock() - StunDebugStartedAt, tag, table.concat(values, " "))
-    table.insert(StunDebugTimeline, line)
-    if #StunDebugTimeline > 2000 then table.remove(StunDebugTimeline, 1) end
+        os.clock() - Dbg.StunStartedAt, tag, table.concat(values, " "))
+    table.insert(Dbg.StunTimeline, line)
+    if #Dbg.StunTimeline > 2000 then table.remove(Dbg.StunTimeline, 1) end
     print(line)
 end
 
@@ -267,18 +269,18 @@ local function getStunDebugOutput()
         "HumanoidState: " .. tostring(humanoid and humanoid:GetState() or "none"),
         "--- TIMELINE ---",
     }, "\n")
-    return header .. "\n" .. table.concat(StunDebugTimeline, "\n")
+    return header .. "\n" .. table.concat(Dbg.StunTimeline, "\n")
 end
 
 UserInputService.InputBegan:Connect(function(input, gameProcessed)
-    if not STUN_DEBUG_EVENTS then return end
+    if not Dbg.StunEvents then return end
     local inputName = input.UserInputType == Enum.UserInputType.Keyboard
         and input.KeyCode.Name or input.UserInputType.Name
     stunDebugLog("INPUT BEGIN", inputName, "processed=", gameProcessed)
 end)
 
 UserInputService.InputEnded:Connect(function(input, gameProcessed)
-    if not STUN_DEBUG_EVENTS then return end
+    if not Dbg.StunEvents then return end
     local inputName = input.UserInputType == Enum.UserInputType.Keyboard
         and input.KeyCode.Name or input.UserInputType.Name
     stunDebugLog("INPUT END", inputName, "processed=", gameProcessed)
@@ -388,19 +390,18 @@ local function isAttackerFacingMe(attackerName, maxAngle)
 end
 
 -- ── Face Lock: rotate toward nearest enemy continuously ──────────────── --
-local faceLockConnection = nil
 
 local function stopFaceLock()
-    if faceLockConnection then
-        faceLockConnection:Disconnect()
-        faceLockConnection = nil
+    if AutoParry.FaceLockConn then
+        AutoParry.FaceLockConn:Disconnect()
+        AutoParry.FaceLockConn = nil
     end
     restoreParryFacing()
 end
 
 local function startFaceLock()
-    if faceLockConnection then return end
-    faceLockConnection = RunService.Heartbeat:Connect(function()
+    if AutoParry.FaceLockConn then return end
+    AutoParry.FaceLockConn = RunService.Heartbeat:Connect(function()
         if not AutoParry.FaceLockEnabled then
             stopFaceLock()
             return
@@ -463,7 +464,7 @@ local function tapParry(attackerName, delay, holdTime, minDelay)
     AutoParry.PendingParry[attackerName] = scheduledAt
     faceAttacker(attackerName)
 
-    if DEBUG_EVENTS then
+    if Dbg.Events then
         debugLog("[BagahHub SCHEDULE]", attackerName, "| delay:", parryDelay,
             "| hold:", holdTime or AutoParry.ParryDuration,
             "| mode:", AutoParry.PerfectEnabled and "perfect" or "normal")
@@ -518,7 +519,7 @@ local function fallbackBlock(attackerName)
     AutoParry.LastFallbackBlock = now
     faceAttacker(attackerName)
     local blockToken = holdBlock()
-    if DEBUG_EVENTS then
+    if Dbg.Events then
         debugLog("[BagahHub FALLBACK]", "safety block", "| attacker:", attackerName,
             "| hold:", AutoParry.FallbackBlockDuration)
     end
@@ -532,10 +533,7 @@ local notify
 -- ========================================================================= --
 --                       PRE-HIT ANIMATION DETECTION                         --
 -- ========================================================================= --
-local animatorConnections = {}
-local modelConnections = {}
-local AttackAnimationIds = {}
-local GrappleAnimationIds = {}
+local AnimReg = { Conns = {}, ModelConns = {}, Attack = {}, Grapple = {} }
 
 local function normalizeAnimationId(animationId)
     return tostring(animationId or ""):match("%d+") or ""
@@ -545,7 +543,7 @@ local function registerAnimation(animation)
     if not animation:IsA("Animation") then return end
     local animationId = normalizeAnimationId(animation.AnimationId)
     if animationId ~= "" then
-        AttackAnimationIds[animationId] = animation:GetFullName()
+        AnimReg.Attack[animationId] = animation:GetFullName()
     end
 end
 
@@ -553,7 +551,7 @@ local function registerGrappleAnimation(animation)
     if not animation:IsA("Animation") then return end
     local animationId = normalizeAnimationId(animation.AnimationId)
     if animationId ~= "" then
-        GrappleAnimationIds[animationId] = animation:GetFullName()
+        AnimReg.Grapple[animationId] = animation:GetFullName()
     end
 end
 
@@ -597,8 +595,8 @@ local function autoPunish(targetName)
 end
 
 local function buildAttackAnimationRegistry()
-    table.clear(AttackAnimationIds)
-    table.clear(GrappleAnimationIds)
+    table.clear(AnimReg.Attack)
+    table.clear(AnimReg.Grapple)
 
     local roots = {
         ReplicatedStorage:FindFirstChild("Animations"),
@@ -669,7 +667,7 @@ local function buildAttackAnimationRegistry()
     end
 
     local registeredCount = 0
-    for _ in AttackAnimationIds do
+    for _ in AnimReg.Attack do
         registeredCount += 1
     end
     debugLog("[BagahHub REGISTRY]", "Registered attack animations:", registeredCount)
@@ -678,10 +676,10 @@ end
 buildAttackAnimationRegistry()
 
 local function disconnectAnimator(model)
-    local connection = animatorConnections[model]
+    local connection = AnimReg.Conns[model]
     if connection then
         connection:Disconnect()
-        animatorConnections[model] = nil
+        AnimReg.Conns[model] = nil
     end
 end
 
@@ -699,19 +697,22 @@ local function watchCharacter(character)
             or humanoid:WaitForChild("Animator", 10))
         if not animator or not character.Parent then return end
 
-        animatorConnections[character] = animator.AnimationPlayed:Connect(function(track)
+        AnimReg.Conns[character] = animator.AnimationPlayed:Connect(function(track)
             if not isAnyAutoParryEnabled() and not AutoParry.GrappleAwareEnabled then return end
             if character:GetAttribute("CanFight") == false or character:GetAttribute("Ragdoll") == true then return end
             local maxDistance = AutoParry.PerfectEnabled
                 and PERFECT_PARRY_CONFIG.MaxDistance or AutoParry.MaxDistance
-            if getAttackerDistance(character.Name) > maxDistance then return end
+            if getAttackerDistance(character.Name) > maxDistance then
+                fallbackBlock(character.Name)
+                return
+            end
 
             local animationId = normalizeAnimationId(track.Animation and track.Animation.AnimationId)
             if animationId == "" then return end
-            local registryPath = AttackAnimationIds[animationId]
-            local grapplePath = GrappleAnimationIds[animationId]
+            local registryPath = AnimReg.Attack[animationId]
+            local grapplePath = AnimReg.Grapple[animationId]
 
-            if DEBUG_EVENTS then
+            if Dbg.Events then
                 debugLog("[BagahHub ANIMATION]", character.Name, "| name:", track.Name,
                     "| id:", animationId, "| priority:", track.Priority.Name,
                     "| attack:", registryPath or false, "| grapple:", grapplePath or false)
@@ -750,7 +751,7 @@ local function watchCharacter(character)
                         or getPerfectDefaultImpactTime(registryPath)
                     local parryDelay = impactTime - PERFECT_PARRY_CONFIG.InputLead
                         - MOBILE_EXTRA_LEAD - getNetworkOneWayTime() - correction
-                    if DEBUG_EVENTS then
+                    if Dbg.Events then
                         debugLog("[BagahHub SYNC]", animationId,
                             "| enabled:", AutoParry.AnimationSyncEnabled,
                             "| correction:", correction,
@@ -787,7 +788,7 @@ local function watchContainer(container)
     for _, character in container:GetChildren() do
         watchCharacter(character)
     end
-    modelConnections[container] = container.ChildAdded:Connect(watchCharacter)
+    AnimReg.ModelConns[container] = container.ChildAdded:Connect(watchCharacter)
     container.ChildRemoved:Connect(disconnectAnimator)
 end
 
@@ -809,7 +810,7 @@ CombatClientRemote.OnClientEvent:Connect(function(...)
     local args      = { ... }
     local eventType = args[1]
 
-    if DEBUG_EVENTS then
+    if Dbg.Events then
         local argStr = ""
         for i = 1, math.min(#args, 6) do
             argStr = argStr .. tostring(args[i]) .. " | "
@@ -856,15 +857,15 @@ CombatClientRemote.OnClientEvent:Connect(function(...)
                         AutoParry.LearnedImpactTime[recent.Id] = learnedImpact
                         local learnedDelay = math.max(AutoParry.MinParryDelay,
                             learnedImpact - AutoParry.ImpactLead)
-                        if DEBUG_EVENTS then
+                        if Dbg.Events then
                             debugLog("[BagahHub LEARNED]", recent.Id, "| sample:", impactTime,
                                 "| smoothed impact:", learnedImpact, "| next delay:", learnedDelay)
                         end
                     end
-                elseif DEBUG_EVENTS then
+                elseif Dbg.Events then
                     debugLog("[BagahHub LEARN]", "no registered attack-animation candidate for", attacker)
                 end
-                if DEBUG_EVENTS then
+                if Dbg.Events then
                     debugLog("[BagahHub IMPACT]", attacker, "| distance:", distance)
                 end
             end
@@ -886,7 +887,7 @@ CombatClientRemote.OnClientEvent:Connect(function(...)
                 end
             end
             autoPunish(recentTarget)
-            if DEBUG_EVENTS then
+            if Dbg.Events then
                 debugLog("[BagahHub RESULT]", "PERFECT PARRY (Sound)")
             end
             if AutoParry.Notification then
@@ -902,14 +903,14 @@ CombatClientRemote.OnClientEvent:Connect(function(...)
                 AutoParry.TotalBlocks += 1
                 AutoParry.LastBlockResult = now
             end
-            if DEBUG_EVENTS then
+            if Dbg.Events then
                 debugLog("[BagahHub RESULT]", "BLOCKED (Sound)")
             end
         end
 
 
         if action == "PunchHit" and attacker ~= LocalPlayer.Name then
-            if DEBUG_EVENTS then
+            if Dbg.Events then
                 debugLog("[BagahHub RESULT]", "HIT by", attacker)
             end
         end
@@ -929,7 +930,7 @@ CombatClientRemote.OnClientEvent:Connect(function(...)
                 AutoParry.LastPerfectResult = now
             end
             autoPunish(attacker)
-            if DEBUG_EVENTS then
+            if Dbg.Events then
                 debugLog("[BagahHub RESULT]", "PERFECT PARRY | attacker:", attacker,
                     "| victim:", victim)
             end
@@ -945,7 +946,7 @@ CombatClientRemote.OnClientEvent:Connect(function(...)
                 AutoParry.TotalBlocks += 1
                 AutoParry.LastBlockResult = now
             end
-            if DEBUG_EVENTS then
+            if Dbg.Events then
                 debugLog("[BagahHub RESULT]", "BLOCKED | attacker:", attacker, "| victim:", victim)
             end
         end
@@ -1044,8 +1045,8 @@ end
 -- ========================================================================= --
 --                         PLAYER TAB / RHYTHM PLAYER                       --
 -- ========================================================================= --
-local PlayerGui                = LocalPlayer:WaitForChild("PlayerGui")
-local Rhythm                   = {
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+local Rhythm    = {
     Enabled = false,
     Root = nil,
     Active = {},
@@ -1056,7 +1057,7 @@ local Rhythm                   = {
     Receptors = {},
     LaneCount = 4,
     LastPress = {},
-    HitWindow = UserInputService.TouchEnabled and 0.12 or 0.035,
+    HitWindow = UserInputService.TouchEnabled and 0.12 or 0.08,
     MinInterval = 0.015,
     NoteTravelTime = 2.5,
     TouchLeadTime = 0.06,
@@ -1065,14 +1066,47 @@ local Rhythm                   = {
     TouchPositions = {},
     TouchCorrection = nil,
     PendingTouches = {},
+    -- ── Timing mode settings ──────────────────────────────────────────
+    Mode = "perfect",   -- "perfect" | "custom"
+    PressLeadMs = 0,    -- extra ms to press early (default 0)
+    HoldExtendMs = 80,  -- extra ms to hold long notes (default 80)
+    PerfectChance = 70, -- % chance of PERFECT in custom mode
+    GoodChance = 25,    -- % chance of GOOD in custom mode
+    OkChance = 5,       -- % chance of OK in custom mode
+    -- ── Debug ─────────────────────────────────────────────────────────
     DebugEnabled = false,
     DebugTimeline = {},
     DebugStartedAt = os.clock(),
     LastMissingRootDebug = 0,
+    -- ── Internal state (moved from locals to save upvalue slots) ─────
+    BuildId = "rhythm-notetime-20260802-5",
+    Connections = {},
+    ManualTouchStarted = {},
+    DebugRootReported = nil,
+    TaskDelayComp = 0.016,
+    RenderConn = nil,
+    LastScan = 0,
+    ScanInterval = 0.5,
+    -- ── Rating Spy ──────────────────────────────────────────────────
+    RatingSpy = false,
+    RatingConn = nil,
+    RatingRemoveConn = nil,
+    RatingCounts = {},
+    RatingTotal = 0,
+    LastPressAt = {},
+    GuiInspector = false,
+    InspectorConnections = {},
+    InspectorRoot = nil,
+    InspectorIds = setmetatable({}, { __mode = "k" }),
+    NextInspectorId = 0,
+    ClockEvidence = {},
+    -- ── Attribute-based timing (NoteTime / NoteLane) ────────────────
+    ScrollSpeed = nil,
+    ScrollSpeedSamples = {},
+    SongTime = nil,
+    SongTimeSamples = {},
+    LastSongTimeAt = 0,
 }
-local rhythmConnections        = {}
-local rhythmManualTouchStarted = {}
-local RHYTHM_BUILD_ID          = "android-four-key-timing-align-20260727-7"
 
 local function rhythmDebug(tag, ...)
     if not Rhythm.DebugEnabled then return end
@@ -1089,7 +1123,7 @@ local function makeRhythmDebugReport()
     for _ in pairs(Rhythm.Active) do count += 1 end
     return table.concat({
         "BagahHub Gakuran Rhythm Debug",
-        "Build: " .. RHYTHM_BUILD_ID,
+        "Build: " .. Rhythm.BuildId,
         "Copied: " .. os.date("!%Y-%m-%dT%H:%M:%SZ"),
         "TouchEnabled: " .. tostring(UserInputService.TouchEnabled),
         "KeyboardEnabled: " .. tostring(UserInputService.KeyboardEnabled),
@@ -1098,6 +1132,19 @@ local function makeRhythmDebugReport()
         "Root: " .. tostring(Rhythm.Root),
         "LaneCount: " .. tostring(Rhythm.LaneCount),
         "TrackedNotes: " .. tostring(count),
+        "ScrollSpeed: " .. tostring(Rhythm.ScrollSpeed),
+        "SongTime: " .. tostring(Rhythm.SongTime),
+        "--- RATING SPY ---",
+        "RatingSpy: " .. tostring(Rhythm.RatingSpy),
+        "Total: " .. tostring(Rhythm.RatingTotal),
+        "Perfect: " .. tostring(Rhythm.RatingCounts["Perfect"] or 0),
+        "Great: " .. tostring(Rhythm.RatingCounts["Great"] or 0),
+        "Good: " .. tostring(Rhythm.RatingCounts["Good"] or 0),
+        "Ok: " .. tostring(Rhythm.RatingCounts["Ok"] or 0),
+        "Bad: " .. tostring(Rhythm.RatingCounts["Bad"] or 0),
+        "Miss: " .. tostring(Rhythm.RatingCounts["Miss"] or 0),
+        "--- CLOCK EVIDENCE ---",
+        #Rhythm.ClockEvidence > 0 and table.concat(Rhythm.ClockEvidence, "\n") or "No clock candidates captured",
         "--- TIMELINE ---",
         table.concat(Rhythm.DebugTimeline, "\n"),
     }, "\n")
@@ -1167,19 +1214,19 @@ end
 
 local function copyActiveDebugLogs()
     local reports = {}
-    if DEBUG_EVENTS then
+    if Dbg.Events then
         table.insert(reports, getAutoParryDebugOutput())
     end
-    if STUN_DEBUG_EVENTS then
+    if Dbg.StunEvents then
         table.insert(reports, getStunDebugOutput())
     end
     if Rhythm.DebugEnabled then
         table.insert(reports, makeRhythmDebugReport())
     end
-    if AR_DEBUG then
+    if Dbg.ArDebug then
         local report = "=== Auto Respawn Debug ===\n"
-        if #AR_DEBUG_TIMELINE > 0 then
-            report = report .. table.concat(AR_DEBUG_TIMELINE, "\n")
+        if #Dbg.ArTimeline > 0 then
+            report = report .. table.concat(Dbg.ArTimeline, "\n")
         else
             report = report .. "(no knock events yet)"
         end
@@ -1204,8 +1251,17 @@ local function copyActiveDebugLogs()
 end
 
 UserInputService.InputBegan:Connect(function(input, gameProcessed)
-    if not gameProcessed and input.KeyCode == DEBUG_COPY_KEY then
+    if not gameProcessed and input.KeyCode == Dbg.CopyKey then
         copyActiveDebugLogs()
+    end
+    -- Track manual rhythm key presses for rating delta calculation
+    if Rhythm.RatingSpy and input.UserInputType == Enum.UserInputType.Keyboard then
+        for lane, key in ipairs(Rhythm.Keys) do
+            if input.KeyCode == key then
+                Rhythm.LastPressAt[lane] = os.clock()
+                break
+            end
+        end
     end
 end)
 
@@ -1230,17 +1286,17 @@ UserInputService.InputBegan:Connect(function(input, processed)
     end
 
     if not Rhythm.DebugEnabled then return end
-    rhythmManualTouchStarted[input] = input.Position
+    Rhythm.ManualTouchStarted[input] = input.Position
     rhythmDebug("REAL TOUCH BEGIN", "pos=", input.Position,
         "processed=", processed, "state=", input.UserInputState)
 end)
 
 UserInputService.InputEnded:Connect(function(input, processed)
     if not Rhythm.DebugEnabled or input.UserInputType ~= Enum.UserInputType.Touch then return end
-    rhythmDebug("REAL TOUCH END", "start=", rhythmManualTouchStarted[input] or "unknown",
+    rhythmDebug("REAL TOUCH END", "start=", Rhythm.ManualTouchStarted[input] or "unknown",
         "pos=", input.Position, "processed=", processed,
         "state=", input.UserInputState)
-    rhythmManualTouchStarted[input] = nil
+    Rhythm.ManualTouchStarted[input] = nil
 end)
 
 UserInputService.TouchTap:Connect(function(positions, processed)
@@ -1253,16 +1309,18 @@ end)
 -- ========================================================================= --
 --                     INFINITE STAMINA + NO DODGE COOLDOWN                   --
 -- ========================================================================= --
-local InfiniteStamina      = false
-local NoDodgeCooldown      = false
-local AntiStun             = false
-local AntiRagdoll          = false
-local DodgeCooldownTime    = 0
-local lastDodgeTime        = 0
-local namecallHooked       = false
-local oldGameNamecall      = nil
-local antiStunConnections  = {}
-local stunDebugConnections = {}
+local CS                   = {
+    InfiniteStamina = false,
+    NoDodgeCooldown = false,
+    AntiStun = false,
+    AntiRagdoll = false,
+    DodgeCooldownTime = 0,
+    LastDodgeTime = 0,
+    NamecallHooked = false,
+    OldNamecall = nil,
+    AntiStunConns = {},
+    StunDebugConns = {},
+}
 
 local dodgeGateSpoof       = {
     OutnumberedEvasiveGrant = true,
@@ -1306,22 +1364,22 @@ local stunAnimationIds = {
 }
 
 local function disconnectAntiStunConnections()
-    for _, connection in ipairs(antiStunConnections) do
+    for _, connection in ipairs(CS.AntiStunConns) do
         connection:Disconnect()
     end
-    table.clear(antiStunConnections)
+    table.clear(CS.AntiStunConns)
 end
 
 local function disconnectStunDebugConnections()
-    for _, connection in ipairs(stunDebugConnections) do
+    for _, connection in ipairs(CS.StunDebugConns) do
         connection:Disconnect()
     end
-    table.clear(stunDebugConnections)
+    table.clear(CS.StunDebugConns)
 end
 
 local function attachStunDebug(character)
     disconnectStunDebugConnections()
-    if not STUN_DEBUG_EVENTS or not character then return end
+    if not Dbg.StunEvents or not character then return end
 
     local humanoid = character:FindFirstChildOfClass("Humanoid")
         or character:WaitForChild("Humanoid", 10)
@@ -1334,30 +1392,30 @@ local function attachStunDebug(character)
         "state=", humanoid:GetState(), "walkSpeed=", humanoid.WalkSpeed,
         "jumpPower=", humanoid.JumpPower, "platformStand=", humanoid.PlatformStand)
 
-    table.insert(stunDebugConnections, character.AttributeChanged:Connect(function(attribute)
+    table.insert(CS.StunDebugConns, character.AttributeChanged:Connect(function(attribute)
         stunDebugLog("ATTRIBUTE", attribute, "=", character:GetAttribute(attribute),
             "all=", character:GetAttributes())
     end))
-    table.insert(stunDebugConnections, humanoid.StateChanged:Connect(function(oldState, newState)
+    table.insert(CS.StunDebugConns, humanoid.StateChanged:Connect(function(oldState, newState)
         stunDebugLog("HUMANOID STATE", oldState, "->", newState,
             "walkSpeed=", humanoid.WalkSpeed, "platformStand=", humanoid.PlatformStand)
     end))
-    table.insert(stunDebugConnections, humanoid:GetPropertyChangedSignal("WalkSpeed"):Connect(function()
+    table.insert(CS.StunDebugConns, humanoid:GetPropertyChangedSignal("WalkSpeed"):Connect(function()
         stunDebugLog("PROPERTY", "WalkSpeed=", humanoid.WalkSpeed)
     end))
-    table.insert(stunDebugConnections, humanoid:GetPropertyChangedSignal("PlatformStand"):Connect(function()
+    table.insert(CS.StunDebugConns, humanoid:GetPropertyChangedSignal("PlatformStand"):Connect(function()
         stunDebugLog("PROPERTY", "PlatformStand=", humanoid.PlatformStand)
     end))
 
     local animator = humanoid:FindFirstChildOfClass("Animator")
         or humanoid:WaitForChild("Animator", 5)
     if animator then
-        table.insert(stunDebugConnections, animator.AnimationPlayed:Connect(function(track)
+        table.insert(CS.StunDebugConns, animator.AnimationPlayed:Connect(function(track)
             local animation = track.Animation
             stunDebugLog("ANIMATION", "name=", animation and animation.Name or track.Name,
                 "id=", animation and animation.AnimationId or "none",
                 "priority=", track.Priority, "length=", track.Length)
-            table.insert(stunDebugConnections, track.Stopped:Connect(function()
+            table.insert(CS.StunDebugConns, track.Stopped:Connect(function()
                 stunDebugLog("ANIMATION STOP", "name=", animation and animation.Name or track.Name,
                     "id=", animation and animation.AnimationId or "none")
             end))
@@ -1388,9 +1446,9 @@ local function getRecoveryAnimationType(track)
 end
 
 local function cancelRecovery(character, humanoid)
-    if not (AntiStun or AntiRagdoll) or not character or not humanoid then return end
+    if not (CS.AntiStun or CS.AntiRagdoll) or not character or not humanoid then return end
 
-    if AntiRagdoll then
+    if CS.AntiRagdoll then
         humanoid.PlatformStand = false
         humanoid.Sit = false
         humanoid.AutoRotate = true
@@ -1411,8 +1469,8 @@ local function cancelRecovery(character, humanoid)
     if animator then
         for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
             local animationType = getRecoveryAnimationType(track)
-            if (animationType == "stun" and AntiStun)
-                or (animationType == "ragdoll" and AntiRagdoll) then
+            if (animationType == "stun" and CS.AntiStun)
+                or (animationType == "ragdoll" and CS.AntiRagdoll) then
                 track:Stop(0)
             end
         end
@@ -1421,20 +1479,20 @@ end
 
 local function attachAntiStun(character)
     disconnectAntiStunConnections()
-    if not (AntiStun or AntiRagdoll) or not character then return end
+    if not (CS.AntiStun or CS.AntiRagdoll) or not character then return end
 
     local humanoid = character:FindFirstChildOfClass("Humanoid")
         or character:WaitForChild("Humanoid", 10)
     if not humanoid then return end
 
     cancelRecovery(character, humanoid)
-    table.insert(antiStunConnections, character.AttributeChanged:Connect(function(attribute)
-        if (AntiStun and stunAttrs[attribute]) or (AntiRagdoll and ragdollAttrs[attribute]) then
+    table.insert(CS.AntiStunConns, character.AttributeChanged:Connect(function(attribute)
+        if (CS.AntiStun and stunAttrs[attribute]) or (CS.AntiRagdoll and ragdollAttrs[attribute]) then
             task.defer(cancelRecovery, character, humanoid)
         end
     end))
-    table.insert(antiStunConnections, humanoid.StateChanged:Connect(function(_, newState)
-        if AntiRagdoll and (newState == Enum.HumanoidStateType.Ragdoll
+    table.insert(CS.AntiStunConns, humanoid.StateChanged:Connect(function(_, newState)
+        if CS.AntiRagdoll and (newState == Enum.HumanoidStateType.Ragdoll
                 or newState == Enum.HumanoidStateType.FallingDown
                 or newState == Enum.HumanoidStateType.GettingUp
                 or newState == Enum.HumanoidStateType.PlatformStanding) then
@@ -1445,10 +1503,10 @@ local function attachAntiStun(character)
     local animator = humanoid:FindFirstChildOfClass("Animator")
         or humanoid:WaitForChild("Animator", 5)
     if animator then
-        table.insert(antiStunConnections, animator.AnimationPlayed:Connect(function(track)
+        table.insert(CS.AntiStunConns, animator.AnimationPlayed:Connect(function(track)
             local animationType = getRecoveryAnimationType(track)
-            if (animationType == "stun" and AntiStun)
-                or (animationType == "ragdoll" and AntiRagdoll) then
+            if (animationType == "stun" and CS.AntiStun)
+                or (animationType == "ragdoll" and CS.AntiRagdoll) then
                 track:Stop(0)
             end
         end))
@@ -1463,23 +1521,23 @@ local function getLocalStaminaModel()
 end
 
 local function hookNamecall()
-    if namecallHooked then return end
-    namecallHooked = true
+    if CS.NamecallHooked then return end
+    CS.NamecallHooked = true
 
     local success, result = pcall(function()
-        oldGameNamecall = hookmetamethod(game, "__namecall", function(self, ...)
+        CS.OldNamecall = hookmetamethod(game, "__namecall", function(self, ...)
             local method = getnamecallmethod()
 
-            if STUN_DEBUG_EVENTS and (method == "FireServer" or method == "InvokeServer") then
+            if Dbg.StunEvents and (method == "FireServer" or method == "InvokeServer") then
                 stunDebugLog("REMOTE OUT", method, self, { ... })
             end
 
             -- ── Stamina ────────────────────────────────────────────── --
-            if InfiniteStamina and self == cachedCharacter then
+            if CS.InfiniteStamina and self == cachedCharacter then
                 if method == "SetAttribute" then
                     local attr = select(1, ...)
                     if attr == "Stamina" then
-                        return oldGameNamecall(self, "Stamina", 100)
+                        return CS.OldNamecall(self, "Stamina", 100)
                     end
                 elseif method == "GetAttribute" then
                     local attr = select(1, ...)
@@ -1489,16 +1547,16 @@ local function hookNamecall()
                 end
             end
 
-            if InfiniteStamina and method == "FireServer" and SprintRemote and self == SprintRemote then
+            if CS.InfiniteStamina and method == "FireServer" and SprintRemote and self == SprintRemote then
                 local arg1 = select(1, ...)
                 if type(arg1) == "table" and arg1.Stamina ~= nil then
                     arg1.Stamina = 100
                 end
-                return oldGameNamecall(self, ...)
+                return CS.OldNamecall(self, ...)
             end
 
             -- ── No Dodge Cooldown (manual Q, no auto-loop) ──────────── --
-            if NoDodgeCooldown then
+            if CS.NoDodgeCooldown then
                 if method == "GetAttribute" and self == cachedCharacter then
                     local attr = select(1, ...)
                     local spoofValue = dodgeGateSpoof[attr]
@@ -1511,27 +1569,27 @@ local function hookNamecall()
                         return
                     end
                     if attr == "CombatActionToken" then
-                        return oldGameNamecall(self, "CombatActionToken", 1)
+                        return CS.OldNamecall(self, "CombatActionToken", 1)
                     end
-                elseif method == "FireServer" and DodgeCooldownTime > 0 and self == RemotesServer then
+                elseif method == "FireServer" and CS.DodgeCooldownTime > 0 and self == RemotesServer then
                     local arg1 = select(1, ...)
                     if type(arg1) == "table"
                         and arg1.Type == "Combat"
                         and arg1.Action == "Evasive" then
                         local now = os.clock()
-                        if now - lastDodgeTime < DodgeCooldownTime then
+                        if now - CS.LastDodgeTime < CS.DodgeCooldownTime then
                             return
                         end
-                        lastDodgeTime = now
+                        CS.LastDodgeTime = now
                     end
                 end
             end
 
             -- ── Independent Anti-Stun / Anti-Ragdoll ───────────────── --
-            if (AntiStun or AntiRagdoll) and method == "GetAttribute" and self == cachedCharacter then
+            if (CS.AntiStun or CS.AntiRagdoll) and method == "GetAttribute" and self == cachedCharacter then
                 local attr = select(1, ...)
-                if (AntiStun and stunAttrs[attr])
-                    or (AntiRagdoll and ragdollAttrs[attr]) then
+                if (CS.AntiStun and stunAttrs[attr])
+                    or (CS.AntiRagdoll and ragdollAttrs[attr]) then
                     return nil
                 end
             end
@@ -1545,32 +1603,32 @@ local function hookNamecall()
                 end
             end
 
-            return oldGameNamecall(self, ...)
+            return CS.OldNamecall(self, ...)
         end)
     end)
 
     if not success then
         warn("[BagahHub] __namecall hook failed:", result)
-        namecallHooked = false
+        CS.NamecallHooked = false
     else
         print("[BagahHub] Unified namecall hook active (stamina + dodge)")
     end
 end
 
 local function setInfiniteStamina(value)
-    InfiniteStamina = value
+    CS.InfiniteStamina = value
     if value then hookNamecall() end
 end
 
 local function setNoDodgeCooldown(value)
-    NoDodgeCooldown = value
+    CS.NoDodgeCooldown = value
     if value then
         hookNamecall()
     end
 end
 
 local function updateRecoveryProtection()
-    if AntiStun or AntiRagdoll then
+    if CS.AntiStun or CS.AntiRagdoll then
         hookNamecall()
         attachAntiStun(getLocalStaminaModel())
     else
@@ -1586,12 +1644,12 @@ local function updateRecoveryProtection()
 end
 
 local function setAntiStun(value)
-    AntiStun = value
+    CS.AntiStun = value
     updateRecoveryProtection()
 end
 
 local function setAntiRagdoll(value)
-    AntiRagdoll = value
+    CS.AntiRagdoll = value
     local character = getLocalStaminaModel()
     local humanoid = character and character:FindFirstChildOfClass("Humanoid")
     if not value and humanoid then
@@ -1604,14 +1662,14 @@ end
 
 LocalPlayer.CharacterAdded:Connect(function(character)
     cachedCharacter = character
-    if InfiniteStamina or NoDodgeCooldown or AntiStun or AntiRagdoll or STUN_DEBUG_EVENTS then
-        namecallHooked = false
+    if CS.InfiniteStamina or CS.NoDodgeCooldown or CS.AntiStun or CS.AntiRagdoll or Dbg.StunEvents then
+        CS.NamecallHooked = false
         hookNamecall()
     end
-    if AntiStun or AntiRagdoll then
+    if CS.AntiStun or CS.AntiRagdoll then
         task.defer(attachAntiStun, character)
     end
-    if STUN_DEBUG_EVENTS then
+    if Dbg.StunEvents then
         task.defer(attachStunDebug, character)
     end
 end)
@@ -1754,8 +1812,9 @@ local function rhythmGetHoldDuration(note, receptor, velocity)
     if not tail or not tail:IsA("GuiObject") or not tail.Visible then return nil end
 
     local duration = tail.AbsoluteSize.Y / velocity
+    local extend = (Rhythm.HoldExtendMs or 80) / 1000
 
-    return math.clamp(duration + 0.28, 0.25, 5.0)
+    return math.clamp(duration + extend, 0.25, 5.0)
 end
 
 local function rhythmTap(lane, key)
@@ -1829,7 +1888,9 @@ end
 
 local function rhythmRegister(note)
     if not Rhythm.Enabled or not rhythmIsNote(note) or not note.Visible then return end
-    local lane = rhythmLane(note)
+    local attrLane = note:GetAttribute("NoteLane")
+    local lane = (type(attrLane) == "number" and attrLane >= 1 and attrLane <= Rhythm.LaneCount)
+        and attrLane or rhythmLane(note)
     if not lane or Rhythm.Active[note] then return end
     Rhythm.Active[note] = {
         lane = lane,
@@ -1842,13 +1903,19 @@ local function rhythmRegister(note)
         lastAt = nil,
         wasInactive = false,
         holdDuration = nil,
+        noteTime = note:GetAttribute("NoteTime"),
+        noteLane = lane,
+        lastNoteTime = note:GetAttribute("NoteTime"),
     }
     rhythmDebug("NOTE", "registered", note, "lane=", lane,
+        "noteTime=", Rhythm.Active[note].noteTime,
         "pos=", note.AbsolutePosition, "size=", note.AbsoluteSize)
 end
 
 local function rhythmResetRecycled(note, data)
-    local lane = rhythmLane(note)
+    local attrLane = note:GetAttribute("NoteLane")
+    local lane = (type(attrLane) == "number" and attrLane >= 1 and attrLane <= Rhythm.LaneCount)
+        and attrLane or rhythmLane(note)
     if not lane then return end
     data.lane = lane
     data.key = Rhythm.Keys[lane]
@@ -1858,6 +1925,96 @@ local function rhythmResetRecycled(note, data)
     data.lastY = nil
     data.lastAt = nil
     data.holdDuration = nil
+    data.noteTime = note:GetAttribute("NoteTime")
+    data.noteLane = lane
+    data.lastNoteTime = data.noteTime
+end
+
+local function rhythmInspectorId(object)
+    local id = Rhythm.InspectorIds[object]
+    if not id then
+        Rhythm.NextInspectorId += 1
+        id = Rhythm.NextInspectorId
+        Rhythm.InspectorIds[object] = id
+    end
+    return object.Name .. "#" .. id
+end
+
+-- ── Rating Spy: detect Perfect/Good/Ok/Miss from game UI ─────────────
+local function rhythmConnectRatingSpy(root)
+    if Rhythm.RatingConn then
+        Rhythm.RatingConn:Disconnect()
+        Rhythm.RatingConn = nil
+    end
+    if Rhythm.RatingRemoveConn then
+        Rhythm.RatingRemoveConn:Disconnect()
+        Rhythm.RatingRemoveConn = nil
+    end
+    if not Rhythm.RatingSpy or not root or not root.Parent then return end
+    local seenRatings = setmetatable({}, { __mode = "k" })
+    local ratingKeywords = { "perfect", "great", "good", "ok", "miss", "bad" }
+    local function checkRating(obj)
+        if not Rhythm.RatingSpy then return end
+        if not obj:IsA("TextLabel") and not obj:IsA("TextButton") then return end
+        local text = obj.Text
+        if not text or text == "" then return end
+        local lower = text:lower()
+        for _, keyword in ipairs(ratingKeywords) do
+            if lower:find(keyword, 1, true) then
+                if seenRatings[obj] ~= keyword then
+                    seenRatings[obj] = keyword
+                    local now = os.clock()
+                    local label = keyword:sub(1, 1):upper() .. keyword:sub(2)
+                    Rhythm.RatingCounts[label] = (Rhythm.RatingCounts[label] or 0) + 1
+                    Rhythm.RatingTotal += 1
+                    -- Delta: time since last key press (manual or auto)
+                    local delta = nil
+                    local latestPress = 0
+                    local pressLane = 0
+                    for lane, t in pairs(Rhythm.LastPressAt) do
+                        if t > latestPress then
+                            latestPress = t; pressLane = lane
+                        end
+                    end
+                    if latestPress > 0 then delta = now - latestPress end
+                    -- Position of the judgement label (correlate to lane)
+                    local pos = nil
+                    pcall(function()
+                        if obj:IsA("GuiObject") then
+                            pos = obj.AbsolutePosition
+                        end
+                    end)
+                    rhythmDebug("RATING", label,
+                        "text=", text,
+                        "pos=", pos and string.format("%.0f,%.0f", pos.X, pos.Y) or "n/a",
+                        "pressLane=", pressLane > 0 and pressLane or "n/a",
+                        "delta=", delta and string.format("%.4f", delta) or "n/a",
+                        "id=", rhythmInspectorId(obj),
+                        "total=", Rhythm.RatingTotal)
+                end
+                return
+            end
+        end
+        seenRatings[obj] = nil
+    end
+    local function watchRating(obj)
+        checkRating(obj)
+        if obj:IsA("TextLabel") or obj:IsA("TextButton") then
+            obj:GetPropertyChangedSignal("Text"):Connect(function()
+                checkRating(obj)
+            end)
+        end
+    end
+    Rhythm.RatingConn = root.DescendantAdded:Connect(watchRating)
+    Rhythm.RatingRemoveConn = root.DescendantRemoving:Connect(function(obj)
+        seenRatings[obj] = nil
+    end)
+    for _, obj in ipairs(root:GetDescendants()) do
+        if obj:IsA("TextLabel") or obj:IsA("TextButton") then
+            watchRating(obj)
+        end
+    end
+    rhythmDebug("RATING SPY", "started", "monitoring root=", root.Name)
 end
 
 local function rhythmScan()
@@ -1902,6 +2059,7 @@ local function rhythmScan()
     if Rhythm.Root ~= root or not receptorsReady then
         Rhythm.Root = root
         if not rhythmConfigure(root) then return end
+        rhythmConnectRatingSpy(root)
     end
     for _, object in ipairs(root:GetDescendants()) do rhythmRegister(object) end
 end
@@ -1934,6 +2092,161 @@ local function rhythmDebugStructure()
                 "parent=", object.Parent and object.Parent.Name or "nil")
         end
     end
+end
+
+local function rhythmDisconnectGuiInspector()
+    for _, connection in ipairs(Rhythm.InspectorConnections) do connection:Disconnect() end
+    table.clear(Rhythm.InspectorConnections)
+    Rhythm.InspectorRoot = nil
+end
+
+local function rhythmInspectorPath(object)
+    local parts = {}
+    while object and object ~= PlayerGui do
+        table.insert(parts, 1, object.Name)
+        object = object.Parent
+    end
+    return "PlayerGui/" .. table.concat(parts, "/")
+end
+
+local function rhythmInspectObject(object, event)
+    if not Rhythm.GuiInspector or not object then return end
+    local details = { event, "id=", rhythmInspectorId(object), "path=", rhythmInspectorPath(object), "class=", object
+        .ClassName,
+        "parent=", object.Parent and object.Parent.Name or "nil" }
+    if object:IsA("GuiObject") then
+        table.insert(details, "visible="); table.insert(details, object.Visible)
+        table.insert(details, "pos="); table.insert(details, object.AbsolutePosition)
+        table.insert(details, "size="); table.insert(details, object.AbsoluteSize)
+        table.insert(details, "z="); table.insert(details, object.ZIndex)
+        table.insert(details, "layoutPos="); table.insert(details, object.Position)
+        table.insert(details, "layoutSize="); table.insert(details, object.Size)
+    end
+    if object:IsA("TextLabel") or object:IsA("TextButton") or object:IsA("TextBox") then
+        table.insert(details, "text="); table.insert(details, string.format("%q", object.Text))
+        table.insert(details, "textTransparency="); table.insert(details, object.TextTransparency)
+    elseif object:IsA("ImageLabel") or object:IsA("ImageButton") then
+        table.insert(details, "image="); table.insert(details, object.Image)
+        table.insert(details, "imageTransparency="); table.insert(details, object.ImageTransparency)
+    end
+    for name, value in pairs(object:GetAttributes()) do
+        table.insert(details, "attr." .. name .. "="); table.insert(details, value)
+    end
+    rhythmDebug("GUI INSPECT", table.unpack(details))
+end
+
+local function rhythmWatchInspectedObject(object)
+    local lowerName = object.Name:lower()
+    local focused = lowerName:find("hitshard", 1, true)
+        or lowerName:find("judgement", 1, true)
+        or lowerName:find("note", 1, true)
+    if not focused then return end
+    rhythmInspectObject(object, "WATCH")
+    local properties = { "Name", "Parent" }
+    if object:IsA("GuiObject") then
+        -- Position and Size animate continuously while notes travel. Logging those
+        -- signals floods the report and hides lifecycle and judgement changes.
+        table.insert(properties, "Visible")
+    end
+    if object:IsA("TextLabel") or object:IsA("TextButton") or object:IsA("TextBox") then
+        -- TextTransparency is commonly tweened every frame on judgements. Its
+        -- initial/final values are already captured by WATCH and REMOVING.
+        table.insert(properties, "Text")
+    elseif object:IsA("ImageLabel") or object:IsA("ImageButton") then
+        table.insert(properties, "Image"); table.insert(properties, "ImageTransparency")
+    end
+    for _, property in ipairs(properties) do
+        table.insert(Rhythm.InspectorConnections,
+            object:GetPropertyChangedSignal(property):Connect(function()
+                rhythmInspectObject(object, "CHANGED " .. property)
+            end))
+    end
+    table.insert(Rhythm.InspectorConnections, object.AttributeChanged:Connect(function(attribute)
+        rhythmInspectObject(object, "ATTRIBUTE " .. attribute)
+    end))
+end
+
+local function rhythmInspectClockMetadata(ui, root)
+    local clockKeywords = { "song", "music", "time", "clock", "playback", "start", "bpm", "beat", "speed", "offset" }
+    local logged = 0
+    table.clear(Rhythm.ClockEvidence)
+    local function logClock(...)
+        local values = { ... }
+        for index, value in ipairs(values) do values[index] = tostring(value) end
+        local line = table.concat(values, " ")
+        table.insert(Rhythm.ClockEvidence, line)
+        rhythmDebug("CLOCK", line)
+    end
+    local function relevant(name)
+        name = name:lower()
+        for _, keyword in ipairs(clockKeywords) do
+            if name:find(keyword, 1, true) then return true end
+        end
+        return false
+    end
+    local searchRoot = ui or root
+    if not searchRoot then return end
+    local objects = { searchRoot }
+    for _, object in ipairs(searchRoot:GetDescendants()) do table.insert(objects, object) end
+    for _, object in ipairs(objects) do
+        if logged >= 80 then
+            logClock("truncated after 80 candidates")
+            break
+        end
+        local isSound = object:IsA("Sound")
+        local isNamedValue = object:IsA("ValueBase") and relevant(object.Name)
+        if isSound or isNamedValue then
+            logged += 1
+            if isSound then
+                logClock("id=", rhythmInspectorId(object), "path=", rhythmInspectorPath(object),
+                    "class=Sound", "playing=", object.Playing, "timePosition=", object.TimePosition,
+                    "timeLength=", object.TimeLength, "playbackSpeed=", object.PlaybackSpeed,
+                    "soundId=", object.SoundId)
+            else
+                logClock("id=", rhythmInspectorId(object), "path=", rhythmInspectorPath(object),
+                    "class=", object.ClassName, "value=", object.Value)
+            end
+        end
+        for attribute, value in pairs(object:GetAttributes()) do
+            if relevant(attribute) then
+                logged += 1
+                logClock("id=", rhythmInspectorId(object), "path=", rhythmInspectorPath(object),
+                    "attribute=", attribute, "value=", value)
+                if logged >= 80 then break end
+            end
+        end
+    end
+    logClock("candidates=", logged)
+end
+
+local function rhythmConnectGuiInspector()
+    rhythmDisconnectGuiInspector()
+    if not Rhythm.GuiInspector then return end
+    local ui = PlayerGui:FindFirstChild("RhythmServiceUI")
+    local root = ui and ui:FindFirstChild("RhythmRoot") or Rhythm.Root
+    rhythmDebug("GUI INSPECT", "SNAPSHOT", "service=", ui or "missing", "root=", root or "missing")
+    if ui then rhythmInspectObject(ui, "TARGET") end
+    if not root then return end
+    Rhythm.InspectorRoot = root
+    rhythmInspectObject(root, "TARGET")
+    rhythmInspectClockMetadata(ui, root)
+    local judgement = root:FindFirstChild("JudgementTemplate", true)
+    rhythmDebug("GUI INSPECT", "judgement=", judgement or "missing")
+    if judgement then rhythmInspectObject(judgement, "TARGET") end
+    for _, object in ipairs(root:GetDescendants()) do rhythmWatchInspectedObject(object) end
+    table.insert(Rhythm.InspectorConnections, root.DescendantAdded:Connect(function(object)
+        rhythmInspectObject(object, "ADDED")
+        rhythmWatchInspectedObject(object)
+    end))
+    table.insert(Rhythm.InspectorConnections, root.DescendantRemoving:Connect(function(object)
+        local name = object.Name:lower()
+        if name:find("hitshard", 1, true) or name:find("judgement", 1, true)
+            or name:find("note", 1, true) then
+            rhythmInspectObject(object, "REMOVING")
+        end
+    end))
+    rhythmDebug("GUI INSPECT", "watching", rhythmInspectorPath(root),
+        "descendants=", #root:GetDescendants())
 end
 
 local function rhythmDebugAndroidHierarchy()
@@ -1979,25 +2292,90 @@ local function rhythmDebugAndroidHierarchy()
         matched > 300 and "truncated=300" or "complete")
 end
 
-local rhythmDebugRootReported = nil
+-- ── Timing offset: mode-based press timing ────────────────────────────
+-- task.delay fires on next frame boundary → adds ~16ms latency at 60fps.
+-- We compensate by pressing slightly early (Rhythm.TaskDelayComp).
 
-local rhythmConnection = nil
-local lastRhythmScan = 0
-local RHYTHM_SCAN_INTERVAL = 0.5 -- scan for UI root every 0.5s, not every frame
+local function rhythmGetTimingOffset()
+    -- Returns lead time in seconds (positive = press before note reaches receptor)
+    local baseLead = Rhythm.PressLeadMs / 1000 + Rhythm.TaskDelayComp
+    -- Touch input has inherent latency, needs extra base lead
+    if Rhythm.TouchMode then
+        baseLead = baseLead + (Rhythm.LaneCount >= 4 and 0.035 or Rhythm.TouchLeadTime)
+    end
+    if Rhythm.Mode == "perfect" then
+        return baseLead
+    end
+    -- Custom mode: roll probability → PERFECT / GOOD / OK / BAD
+    local roll = math.random(1, 100)
+    local offset
+    if roll <= Rhythm.PerfectChance then
+        offset = 0                             -- PERFECT: exact
+    elseif roll <= Rhythm.PerfectChance + Rhythm.GoodChance then
+        offset = (math.random() - 0.5) * 0.030 -- GOOD: ±15ms
+    elseif roll <= Rhythm.PerfectChance + Rhythm.GoodChance + Rhythm.OkChance then
+        offset = (math.random() - 0.5) * 0.060 -- OK: ±30ms
+    else
+        offset = (math.random() - 0.5) * 0.100 -- BAD: ±50ms
+    end
+    return baseLead + offset
+end
+
+local function rhythmCalibrateScrollSpeed(note, data, now, noteY)
+    if data.lastY and data.lastAt then
+        local dt = now - data.lastAt
+        local dy = noteY - data.lastY
+        if dt > 0.001 and math.abs(dy) >= 2 and math.abs(dy) < 120 then
+            local speed = dy / dt
+            if speed > 50 and speed < 2000 then
+                table.insert(Rhythm.ScrollSpeedSamples, speed)
+                if #Rhythm.ScrollSpeedSamples > 60 then
+                    table.remove(Rhythm.ScrollSpeedSamples, 1)
+                end
+                if #Rhythm.ScrollSpeedSamples >= 5 then
+                    local sorted = {}
+                    for _, s in ipairs(Rhythm.ScrollSpeedSamples) do
+                        table.insert(sorted, s)
+                    end
+                    table.sort(sorted)
+                    local median = sorted[math.ceil(#sorted / 2)]
+                    if not Rhythm.ScrollSpeed then
+                        Rhythm.ScrollSpeed = median
+                    else
+                        local clampedMedian = math.clamp(median,
+                            Rhythm.ScrollSpeed * 0.92, Rhythm.ScrollSpeed * 1.08)
+                        Rhythm.ScrollSpeed = Rhythm.ScrollSpeed * 0.7 + clampedMedian * 0.3
+                    end
+                end
+            end
+            return speed
+        end
+    end
+    return nil
+end
+
+local function rhythmDeriveSongTime(noteTime, noteY, receptorY)
+    if not Rhythm.ScrollSpeed or Rhythm.ScrollSpeed <= 0 then return nil end
+    local distanceToReceptor = receptorY - noteY
+    local timeToHit = distanceToReceptor / Rhythm.ScrollSpeed
+    return noteTime - timeToHit, timeToHit
+end
 
 local function rhythmStep()
     if not Rhythm.Enabled then return end
     local now = os.clock()
-    -- Only do expensive PlayerGui:GetDescendants() scan periodically or when root is missing
-    if not Rhythm.Root or now - lastRhythmScan >= RHYTHM_SCAN_INTERVAL then
-        lastRhythmScan = now
+    if not Rhythm.Root or now - Rhythm.LastScan >= Rhythm.ScanInterval then
+        Rhythm.LastScan = now
         rhythmScan()
     end
     if Rhythm.DebugEnabled and Rhythm.Root
-        and rhythmDebugRootReported ~= Rhythm.Root then
-        rhythmDebugRootReported = Rhythm.Root
+        and Rhythm.DebugRootReported ~= Rhythm.Root then
+        Rhythm.DebugRootReported = Rhythm.Root
         rhythmDebugStructure()
     end
+
+    local songTimeVotes = {}
+
     for note, data in pairs(Rhythm.Active) do
         if not note.Parent then
             Rhythm.Active[note] = nil
@@ -2005,52 +2383,89 @@ local function rhythmStep()
             data.wasInactive = true
             data.lastY = nil; data.lastAt = nil
             if data.pressed then data.pressed = false end
-        elseif not data.pressed and Rhythm.Receptors[data.lane] then
-            data.tail = note:FindFirstChild("Tail")
-            data.isHold = data.tail and data.tail:IsA("GuiObject")
-                and data.tail.Visible and data.tail.AbsoluteSize.Y > 1 or false
-            if data.wasInactive or data.parent ~= note.Parent then
+        else
+            local noteTime = note:GetAttribute("NoteTime")
+            if data.wasInactive or data.parent ~= note.Parent
+                or (noteTime and data.lastNoteTime and noteTime ~= data.lastNoteTime) then
                 rhythmResetRecycled(note, data)
             end
-            local receptor = Rhythm.Receptors[data.lane]
-            local y = note.AbsolutePosition.Y + note.AbsoluteSize.Y / 2
-            local target = receptor.AbsolutePosition.Y + receptor.AbsoluteSize.Y / 2
-            local velocity = data.lastY and data.lastAt and (y - data.lastY) / (now - data.lastAt) or nil
-            if velocity and math.abs(y - data.lastY) >= 120 then
-                velocity = nil
-                data.lastY = y
-                data.lastAt = now
-            end
-            if data.isHold and velocity and velocity > 1 then
-                data.holdDuration = rhythmGetHoldDuration(note, receptor, velocity)
-            end
-            data.lastY, data.lastAt = y, now
-            if velocity and velocity > 1 then
-                local eta = (target - y) / velocity
-                if eta >= -0.004 and eta <= Rhythm.HitWindow and now - (Rhythm.LastPress[data.lane] or 0) >= Rhythm.MinInterval then
-                    data.pressed = true
-                    Rhythm.LastPress[data.lane] = now
-                    local leadTime = Rhythm.TouchMode
-                        and (Rhythm.LaneCount >= 4 and 0.035 or Rhythm.TouchLeadTime)
-                        or 0.008
-                    local delay = math.max(0, eta - leadTime)
-                    local scheduledHold = data.isHold and data.holdDuration or nil
-                    local generation = Rhythm.Generation
-                    rhythmDebug("HIT", "lane=", data.lane, "eta=", string.format("%.4f", eta),
-                        "velocity=", string.format("%.2f", velocity), "hold=", scheduledHold ~= nil,
-                        "noteY=", string.format("%.1f", y), "targetY=", string.format("%.1f", target))
-                    task.delay(delay, function()
-                        if not Rhythm.Enabled or generation ~= Rhythm.Generation then return end
+            data.lastNoteTime = noteTime
+            data.noteTime = noteTime
+
+            if not data.pressed and Rhythm.Receptors[data.lane] then
+                data.tail = note:FindFirstChild("Tail")
+                data.isHold = data.tail and data.tail:IsA("GuiObject")
+                    and data.tail.Visible and data.tail.AbsoluteSize.Y > 1 or false
+
+                local receptor = Rhythm.Receptors[data.lane]
+                local noteY = note.AbsolutePosition.Y + note.AbsoluteSize.Y / 2
+                local receptorY = receptor.AbsolutePosition.Y + receptor.AbsoluteSize.Y / 2
+                local frameVelocity = rhythmCalibrateScrollSpeed(note, data, now, noteY)
+                data.lastY, data.lastAt = noteY, now
+
+                local effectiveSpeed = Rhythm.ScrollSpeed
+                if data.isHold and effectiveSpeed and effectiveSpeed > 1 then
+                    data.holdDuration = rhythmGetHoldDuration(note, receptor, effectiveSpeed)
+                end
+
+                if noteTime and Rhythm.ScrollSpeed and #Rhythm.ScrollSpeedSamples >= 15 then
+                    local songTime, timeToHit = rhythmDeriveSongTime(noteTime, noteY, receptorY)
+                    if songTime then
+                        table.insert(songTimeVotes, songTime)
+                    end
+
+                    if timeToHit and timeToHit <= 0.016 and timeToHit >= -0.080
+                        and now - (Rhythm.LastPress[data.lane] or 0) >= Rhythm.MinInterval then
+                        data.pressed = true
+                        Rhythm.LastPress[data.lane] = now
+                        Rhythm.LastPressAt[data.lane] = now
+                        local scheduledHold = data.isHold and data.holdDuration or nil
+                        local generation = Rhythm.Generation
+                        rhythmDebug("HIT", "lane=", data.lane, "noteTime=", string.format("%.4f", noteTime),
+                            "timeToHit=", string.format("%.4f", timeToHit),
+                            "scrollSpeed=", string.format("%.1f", Rhythm.ScrollSpeed),
+                            "hold=", scheduledHold ~= nil, "immediate=true")
                         if scheduledHold then
                             rhythmHoldUntilTail(note, receptor, data.lane, data.key,
                                 scheduledHold, generation)
                         else
                             rhythmTap(data.lane, data.key)
                         end
-                    end)
+                    end
+                elseif frameVelocity and frameVelocity > 1 then
+                    local eta = (receptorY - noteY) / frameVelocity
+                    if eta <= 0.016 and eta >= -0.080
+                        and now - (Rhythm.LastPress[data.lane] or 0) >= Rhythm.MinInterval then
+                        data.pressed = true
+                        Rhythm.LastPress[data.lane] = now
+                        Rhythm.LastPressAt[data.lane] = now
+                        local scheduledHold = data.isHold and data.holdDuration or nil
+                        local generation = Rhythm.Generation
+                        rhythmDebug("HIT", "lane=", data.lane, "eta=", string.format("%.4f", eta),
+                            "velocity=", string.format("%.2f", frameVelocity), "hold=", scheduledHold ~= nil,
+                            "noteY=", string.format("%.1f", noteY), "targetY=", string.format("%.1f", receptorY),
+                            "immediate=true")
+                        if scheduledHold then
+                            rhythmHoldUntilTail(note, receptor, data.lane, data.key,
+                                scheduledHold, generation)
+                        else
+                            rhythmTap(data.lane, data.key)
+                        end
+                    end
                 end
+            else
+                local noteY = note.AbsolutePosition.Y + note.AbsoluteSize.Y / 2
+                rhythmCalibrateScrollSpeed(note, data, now, noteY)
+                data.lastY, data.lastAt = noteY, now
             end
         end
+    end
+
+    if #songTimeVotes > 0 then
+        local sum = 0
+        for _, v in ipairs(songTimeVotes) do sum += v end
+        Rhythm.SongTime = sum / #songTimeVotes
+        Rhythm.LastSongTimeAt = now
     end
 end
 
@@ -2060,17 +2475,22 @@ local function setRhythmEnabled(value)
     if not value then
         rhythmReleaseAll()
         table.clear(Rhythm.Active)
-        -- Disconnect RenderStepped when disabled (saves mobile perf)
-        if rhythmConnection then
-            rhythmConnection:Disconnect()
-            rhythmConnection = nil
+        table.clear(Rhythm.ScrollSpeedSamples)
+        Rhythm.ScrollSpeed = nil
+        Rhythm.SongTime = nil
+        Rhythm.SongTimeSamples = {}
+        if Rhythm.RatingConn then
+            Rhythm.RatingConn:Disconnect(); Rhythm.RatingConn = nil
+        end
+        if Rhythm.RenderConn then
+            Rhythm.RenderConn:Disconnect()
+            Rhythm.RenderConn = nil
         end
     else
-        lastRhythmScan = 0 -- force immediate scan
+        Rhythm.LastScan = 0
         rhythmScan()
-        -- Only connect RenderStepped when actually enabled
-        if not rhythmConnection then
-            rhythmConnection = RunService.RenderStepped:Connect(rhythmStep)
+        if not Rhythm.RenderConn then
+            Rhythm.RenderConn = RunService.RenderStepped:Connect(rhythmStep)
         end
     end
     rhythmDebug("STATE", value and "enabled" or "disabled",
@@ -2086,52 +2506,69 @@ UserInputService.InputBegan:Connect(function(input, processed)
 end)
 PlayerGui.ChildAdded:Connect(function(child)
     if child.Name == "RhythmServiceUI" then
-        task.delay(0.3, rhythmScan)
+        task.delay(0.3, function()
+            rhythmScan()
+            if Rhythm.GuiInspector then rhythmConnectGuiInspector() end
+        end)
+    end
+end)
+PlayerGui.DescendantAdded:Connect(function(descendant)
+    if descendant.Name == "RhythmRoot" and Rhythm.GuiInspector then
+        task.defer(function()
+            if descendant.Parent and Rhythm.InspectorRoot ~= descendant then
+                rhythmScan()
+                rhythmConnectGuiInspector()
+            end
+        end)
     end
 end)
 PlayerGui.ChildRemoved:Connect(function(child)
     if child.Name == "RhythmServiceUI" then
         Rhythm.Generation += 1
         Rhythm.Root = nil; table.clear(Rhythm.Active); rhythmReleaseAll()
+        if Rhythm.GuiInspector then
+            rhythmDisconnectGuiInspector()
+            rhythmDebug("GUI INSPECT", "detached; RhythmServiceUI removed")
+        end
+        if Rhythm.RatingConn then
+            Rhythm.RatingConn:Disconnect(); Rhythm.RatingConn = nil
+        end
     end
 end)
 
-local AutoRespawnEnabled = false
-local autoRespawnConnection = nil
-local autoRespawnTriggered = false
-local waitingForRevive = false
+local AutoRespawn = { Enabled = false, Conn = nil, Triggered = false, WaitingRevive = false }
 
 local function arDebug(...)
-    if not AR_DEBUG then return end
+    if not Dbg.ArDebug then return end
     local parts = {}
     for _, v in ipairs({ ... }) do
         table.insert(parts, tostring(v))
     end
     local msg = table.concat(parts, " ")
     print("[AutoRespawn]", msg)
-    table.insert(AR_DEBUG_TIMELINE, os.date("!%H:%M:%S") .. " " .. msg)
-    if #AR_DEBUG_TIMELINE > 200 then
-        table.remove(AR_DEBUG_TIMELINE, 1)
+    table.insert(Dbg.ArTimeline, os.date("!%H:%M:%S") .. " " .. msg)
+    if #Dbg.ArTimeline > 200 then
+        table.remove(Dbg.ArTimeline, 1)
     end
 end
 
 local function triggerAutoRespawn()
-    if autoRespawnTriggered then
+    if AutoRespawn.Triggered then
         arDebug("already triggered, skipping")
         return
     end
-    autoRespawnTriggered = true
+    AutoRespawn.Triggered = true
     arDebug("trigger called")
     local char = LocalPlayer.Character
     if not char then
         arDebug("no character, aborting")
-        autoRespawnTriggered = false
+        AutoRespawn.Triggered = false
         return
     end
     local hrp = char:FindFirstChild("HumanoidRootPart")
     if not hrp then
         arDebug("no HRP, aborting")
-        autoRespawnTriggered = false
+        AutoRespawn.Triggered = false
         return
     end
     arDebug("teleporting out of bounds")
@@ -2143,19 +2580,19 @@ local function triggerAutoRespawn()
 end
 
 local function attachAutoRespawn(character)
-    if not character or not AutoRespawnEnabled then return end
+    if not character or not AutoRespawn.Enabled then return end
     arDebug("attaching to character", character.Name)
-    if autoRespawnConnection then autoRespawnConnection:Disconnect() end
-    autoRespawnConnection = character.AttributeChanged:Connect(function(attr)
+    if AutoRespawn.Conn then AutoRespawn.Conn:Disconnect() end
+    AutoRespawn.Conn = character.AttributeChanged:Connect(function(attr)
         local val = character:GetAttribute(attr)
         arDebug("AttributeChanged:", attr, "=", tostring(val))
         if attr == "Downed" and val == true then
             arDebug("knocked, waiting for revive...")
-            waitingForRevive = true
+            AutoRespawn.WaitingRevive = true
         end
-        if attr == "Downed" and val == false and waitingForRevive then
+        if attr == "Downed" and val == false and AutoRespawn.WaitingRevive then
             arDebug("revived! triggering respawn...")
-            waitingForRevive = false
+            AutoRespawn.WaitingRevive = false
             task.wait(0.1)
             task.defer(triggerAutoRespawn)
         end
@@ -2163,16 +2600,13 @@ local function attachAutoRespawn(character)
 end
 
 local function detachAutoRespawn()
-    if autoRespawnConnection then
-        autoRespawnConnection:Disconnect()
-        autoRespawnConnection = nil
+    if AutoRespawn.Conn then
+        AutoRespawn.Conn:Disconnect()
+        AutoRespawn.Conn = nil
     end
 end
 
-local FlyEnabled = false
-local FlySpeed = 50
-local flyBodyVelocity, flyBodyGyro, flyConnection = nil, nil, nil
-local flyHumanoid, flyRootPart = nil, nil -- cached refs
+local Fly = { Enabled = false, Speed = 50, BV = nil, BG = nil, Conn = nil, Humanoid = nil, Root = nil }
 
 local function startFly()
     local char = LocalPlayer.Character
@@ -2180,25 +2614,25 @@ local function startFly()
     local rootPart = char:FindFirstChild("HumanoidRootPart")
     local humanoid = char:FindFirstChild("Humanoid")
     if not rootPart or not humanoid then return end
-    FlyEnabled = true
-    flyHumanoid = humanoid
-    flyRootPart = rootPart
-    flyBodyVelocity = Instance.new("BodyVelocity")
-    flyBodyVelocity.MaxForce = Vector3.new(400000, 400000, 400000)
-    flyBodyVelocity.Velocity = Vector3.zero
-    flyBodyVelocity.Parent = rootPart
-    flyBodyGyro = Instance.new("BodyGyro")
-    flyBodyGyro.MaxTorque = Vector3.new(400000, 400000, 400000)
-    flyBodyGyro.CFrame = rootPart.CFrame
-    flyBodyGyro.Parent = rootPart
+    Fly.Enabled = true
+    Fly.Humanoid = humanoid
+    Fly.Root = rootPart
+    Fly.BV = Instance.new("BodyVelocity")
+    Fly.BV.MaxForce = Vector3.new(400000, 400000, 400000)
+    Fly.BV.Velocity = Vector3.zero
+    Fly.BV.Parent = rootPart
+    Fly.BG = Instance.new("BodyGyro")
+    Fly.BG.MaxTorque = Vector3.new(400000, 400000, 400000)
+    Fly.BG.CFrame = rootPart.CFrame
+    Fly.BG.Parent = rootPart
     humanoid.PlatformStand = true
-    if not flyConnection then
-        flyConnection = RunService.Heartbeat:Connect(function()
-            if not FlyEnabled or not flyBodyVelocity or not flyBodyGyro then return end
-            if not flyHumanoid or not flyHumanoid.Parent then return end
+    if not Fly.Conn then
+        Fly.Conn = RunService.Heartbeat:Connect(function()
+            if not Fly.Enabled or not Fly.BV or not Fly.BG then return end
+            if not Fly.Humanoid or not Fly.Humanoid.Parent then return end
             local camera = workspace.CurrentCamera
             local direction = Vector3.zero
-            local moveDir = flyHumanoid.MoveDirection
+            local moveDir = Fly.Humanoid.MoveDirection
             if moveDir.Magnitude > 0 then
                 local forward = camera.CFrame.LookVector
                 local right = camera.CFrame.RightVector
@@ -2211,69 +2645,67 @@ local function startFly()
             if UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) then
                 direction -= Vector3.new(0, 1, 0)
             end
-            flyBodyVelocity.Velocity = direction.Magnitude > 0 and direction.Unit * FlySpeed or Vector3.zero
-            flyBodyGyro.CFrame = camera.CFrame
+            Fly.BV.Velocity = direction.Magnitude > 0 and direction.Unit * Fly.Speed or Vector3.zero
+            Fly.BG.CFrame = camera.CFrame
         end)
     end
 end
 
 local function stopFly()
-    FlyEnabled = false
-    if flyConnection then
-        flyConnection:Disconnect(); flyConnection = nil
+    Fly.Enabled = false
+    if Fly.Conn then
+        Fly.Conn:Disconnect(); Fly.Conn = nil
     end
-    if flyBodyVelocity then
-        flyBodyVelocity:Destroy(); flyBodyVelocity = nil
+    if Fly.BV then
+        Fly.BV:Destroy(); Fly.BV = nil
     end
-    if flyBodyGyro then
-        flyBodyGyro:Destroy(); flyBodyGyro = nil
+    if Fly.BG then
+        Fly.BG:Destroy(); Fly.BG = nil
     end
-    if flyHumanoid and flyHumanoid.Parent then
-        flyHumanoid.PlatformStand = false
+    if Fly.Humanoid and Fly.Humanoid.Parent then
+        Fly.Humanoid.PlatformStand = false
     end
-    flyHumanoid = nil
-    flyRootPart = nil
+    Fly.Humanoid = nil
+    Fly.Root = nil
 end
 
-local NoclipEnabled = false
-local noclipConnection = nil
-local noclipParts = {} -- cached BaseParts, rebuilt on CharacterAdded
+local Noclip = { Enabled = false, Conn = nil, Parts = {} }
 
 local function noclipCacheParts(character)
-    table.clear(noclipParts)
+    table.clear(Noclip.Parts)
     if not character then return end
     for _, part in ipairs(character:GetDescendants()) do
         if part:IsA("BasePart") then
-            table.insert(noclipParts, part)
+            table.insert(Noclip.Parts, part)
         end
     end
 end
 
 local function enableNoclip()
-    if noclipConnection then return end
+    if Noclip.Conn then return end
     noclipCacheParts(LocalPlayer.Character)
-    noclipConnection = RunService.Stepped:Connect(function()
-        for _, part in ipairs(noclipParts) do
+    Noclip.Conn = RunService.Stepped:Connect(function()
+        for _, part in ipairs(Noclip.Parts) do
             if part.Parent then part.CanCollide = false end
         end
     end)
 end
 
 local function disableNoclip()
-    if noclipConnection then
-        noclipConnection:Disconnect(); noclipConnection = nil
+    if Noclip.Conn then
+        Noclip.Conn:Disconnect(); Noclip.Conn = nil
     end
-    for _, part in ipairs(noclipParts) do
+    for _, part in ipairs(Noclip.Parts) do
         pcall(function() part.CanCollide = true end)
     end
-    table.clear(noclipParts)
+    table.clear(Noclip.Parts)
 end
 
 LocalPlayer.CharacterAdded:Connect(function(character)
-    local wasFlying = FlyEnabled
-    local wasNoclipping = NoclipEnabled
-    if FlyEnabled then stopFly() end
-    if NoclipEnabled then disableNoclip() end
+    local wasFlying = Fly.Enabled
+    local wasNoclipping = Noclip.Enabled
+    if Fly.Enabled then stopFly() end
+    if Noclip.Enabled then disableNoclip() end
     if wasFlying then
         task.wait(0.5)
         startFly()
@@ -2282,9 +2714,9 @@ LocalPlayer.CharacterAdded:Connect(function(character)
         task.wait(0.3)
         enableNoclip()
     end
-    if AutoRespawnEnabled then
-        autoRespawnTriggered = false
-        waitingForRevive = false
+    if AutoRespawn.Enabled then
+        AutoRespawn.Triggered = false
+        AutoRespawn.WaitingRevive = false
         task.wait(0.5)
         attachAutoRespawn(character)
     end
@@ -2335,8 +2767,8 @@ PlayerTab:Slider({
     Value = { Min = 0, Max = 3, Default = 0 },
     Step = 0.05,
     Callback = function(value)
-        DodgeCooldownTime = value
-        lastDodgeTime = 0 -- reset throttle so new value applies immediately
+        CS.DodgeCooldownTime = value
+        CS.LastDodgeTime = 0 -- reset throttle so new value applies immediately
     end
 })
 
@@ -2364,7 +2796,7 @@ PlayerTab:Slider({
     Value = { Min = 20, Max = 200, Default = 50 },
     Step = 5,
     Callback = function(value)
-        FlySpeed = value
+        Fly.Speed = value
     end
 })
 
@@ -2375,7 +2807,7 @@ PlayerTab:Toggle({
     Description = "Walk through walls and objects",
     Default = false,
     Callback = function(value)
-        NoclipEnabled = value
+        Noclip.Enabled = value
         if value then
             enableNoclip()
             notify("No Clip", "Enabled", 2)
@@ -2395,7 +2827,7 @@ PlayerTab:Toggle({
     Description = "Auto respawn when knocked by teleporting out of bounds",
     Default = false,
     Callback = function(value)
-        AutoRespawnEnabled = value
+        AutoRespawn.Enabled = value
         if value then
             local char = LocalPlayer.Character
             if char then attachAutoRespawn(char) end
@@ -2411,8 +2843,7 @@ PlayerTab:Divider()
 
 PlayerTab:Section({ Title = "Teleport", TextSize = 20 })
 
-local teleportPlayerName = nil
-local teleportDropdown = nil
+local TeleportUI = { PlayerName = nil, Dropdown = nil }
 
 local function getPlayerList()
     local names = {}
@@ -2426,28 +2857,28 @@ local function getPlayerList()
 end
 
 local function refreshPlayerDropdown()
-    if teleportDropdown then
+    if TeleportUI.Dropdown then
         local list = getPlayerList()
-        teleportDropdown:Refresh(list)
+        TeleportUI.Dropdown:Refresh(list)
         if list[1] and list[1] ~= "No players" then
-            if not teleportPlayerName or not table.find(list, teleportPlayerName) then
-                teleportPlayerName = list[1]
-                teleportDropdown:Select(teleportPlayerName)
+            if not TeleportUI.PlayerName or not table.find(list, TeleportUI.PlayerName) then
+                TeleportUI.PlayerName = list[1]
+                TeleportUI.Dropdown:Select(TeleportUI.PlayerName)
             end
         else
-            teleportPlayerName = nil
+            TeleportUI.PlayerName = nil
         end
     end
 end
 
-teleportDropdown = PlayerTab:Dropdown({
+TeleportUI.Dropdown = PlayerTab:Dropdown({
     Title = "Select Player",
     Flag = "TeleportPlayerDropdown",
     Values = getPlayerList(),
     Value = getPlayerList()[1] or "No players",
     Callback = function(value)
         if value ~= "No players" then
-            teleportPlayerName = value
+            TeleportUI.PlayerName = value
         end
     end
 })
@@ -2456,7 +2887,7 @@ PlayerTab:Button({
     Title = "Teleport to Player",
     Description = "Teleport to the selected player",
     Callback = function()
-        if not teleportPlayerName then
+        if not TeleportUI.PlayerName then
             notify("Teleport", "No player selected", 2)
             return
         end
@@ -2466,14 +2897,14 @@ PlayerTab:Button({
             notify("Teleport", "Character not found", 2)
             return
         end
-        local target = Players:FindFirstChild(teleportPlayerName)
+        local target = Players:FindFirstChild(TeleportUI.PlayerName)
         if not target or not target.Character or not target.Character:FindFirstChild("HumanoidRootPart") then
-            notify("Teleport", teleportPlayerName .. " not found", 2)
+            notify("Teleport", TeleportUI.PlayerName .. " not found", 2)
             refreshPlayerDropdown()
             return
         end
         hrp.CFrame = target.Character.HumanoidRootPart.CFrame + Vector3.new(0, 3, 0)
-        notify("Teleport", "Teleported to " .. teleportPlayerName, 2)
+        notify("Teleport", "Teleported to " .. TeleportUI.PlayerName, 2)
     end
 })
 
@@ -2682,6 +3113,40 @@ AutoParryTab:Slider({
         AutoParry.PingAdjustPercent = Value
     end
 })
+
+AutoParryTab:Section({ Title = "Fallback Safety Block", TextSize = 20 })
+
+AutoParryTab:Toggle({
+    Title = "Fallback Safety Block",
+    Description = "When parry can't trigger (too far), hold block briefly as a safety net",
+    Default = false,
+    Callback = function(Value)
+        AutoParry.FallbackBlockEnabled = Value
+        debugLog("[BagahHub STATE]", "Fallback Safety Block", Value and "enabled" or "disabled")
+    end
+})
+
+AutoParryTab:Slider({
+    Title = "Fallback Block Duration",
+    Description = "How long the safety block is held (seconds)",
+    Flag = "FallbackBlockDurationSlider",
+    Value = { Min = 0.1, Max = 1.5, Default = 0.45 },
+    Step = 0.05,
+    Callback = function(Value)
+        AutoParry.FallbackBlockDuration = Value
+    end
+})
+
+AutoParryTab:Slider({
+    Title = "Fallback Block Range",
+    Description = "Max distance to trigger safety block (studs)",
+    Flag = "FallbackBlockRangeSlider",
+    Value = { Min = 5, Max = 30, Default = 12 },
+    Step = 1,
+    Callback = function(Value)
+        AutoParry.FallbackBlockRange = Value
+    end
+})
 if DEBUG_TAB_ENABLED then
     -- ========================================================================= --
     --                                  DEBUG TAB                                 --
@@ -2693,10 +3158,10 @@ if DEBUG_TAB_ENABLED then
         Description = "Record Auto Parry events; press F8 to copy active debug logs",
         Default = false,
         Callback = function(value)
-            DEBUG_EVENTS = value
+            Dbg.Events = value
             if value then
-                DebugStartedAt = os.clock()
-                table.clear(DebugTimeline)
+                Dbg.StartedAt = os.clock()
+                table.clear(Dbg.Timeline)
                 debugLog("[BagahHub STATE]", "Auto Parry debug enabled")
             end
         end
@@ -2707,13 +3172,13 @@ if DEBUG_TAB_ENABLED then
         Description = "Record attributes, states, animations, properties, and outgoing remotes; press F8 to copy",
         Default = false,
         Callback = function(value)
-            STUN_DEBUG_EVENTS = value
+            Dbg.StunEvents = value
             if value then
-                StunDebugStartedAt = os.clock()
-                table.clear(StunDebugTimeline)
+                Dbg.StunStartedAt = os.clock()
+                table.clear(Dbg.StunTimeline)
                 hookNamecall()
                 attachStunDebug(LocalPlayer.Character)
-                stunDebugLog("STATE", "enabled", "AntiStun=", AntiStun, "AntiRagdoll=", AntiRagdoll)
+                stunDebugLog("STATE", "enabled", "AntiStun=", CS.AntiStun, "AntiRagdoll=", CS.AntiRagdoll)
             else
                 disconnectStunDebugConnections()
             end
@@ -2745,6 +3210,47 @@ if DEBUG_TAB_ENABLED then
         end
     })
 
+    DebugTab:Toggle({
+        Title = "Rhythm Rating Spy",
+        Description = "Detects Perfect/Good/Ok/Miss ratings from game UI and logs timing delta",
+        Default = false,
+        Callback = function(value)
+            Rhythm.RatingSpy = value
+            if value then
+                table.clear(Rhythm.RatingCounts)
+                Rhythm.RatingTotal = 0
+                table.clear(Rhythm.LastPressAt)
+                rhythmConnectRatingSpy(Rhythm.Root)
+                rhythmDebug("RATING SPY", "enabled", "root=", Rhythm.Root or "nil")
+            else
+                if Rhythm.RatingConn then
+                    Rhythm.RatingConn:Disconnect()
+                    Rhythm.RatingConn = nil
+                end
+                rhythmDebug("RATING SPY", "disabled", "total=", Rhythm.RatingTotal)
+            end
+        end
+    })
+
+    DebugTab:Toggle({
+        Title = "Rhythm GUI Inspector",
+        Description = "Watch RhythmServiceUI, RhythmRoot, Judgement, Note, and HitShard changes; press F8 to copy",
+        Default = false,
+        Callback = function(value)
+            Rhythm.GuiInspector = value
+            if value then
+                Rhythm.DebugEnabled = true
+                Rhythm.DebugStartedAt = os.clock()
+                table.clear(Rhythm.DebugTimeline)
+                rhythmScan()
+                rhythmConnectGuiInspector()
+            else
+                rhythmDebug("GUI INSPECT", "disabled")
+                rhythmDisconnectGuiInspector()
+            end
+        end
+    })
+
     DebugTab:Divider()
 
     DebugTab:Toggle({
@@ -2752,11 +3258,11 @@ if DEBUG_TAB_ENABLED then
         Description = "Log knock detection and teleport trigger events",
         Default = false,
         Callback = function(value)
-            AR_DEBUG = value
+            Dbg.ArDebug = value
             if value then
-                table.clear(AR_DEBUG_TIMELINE)
+                table.clear(Dbg.ArTimeline)
                 arDebug("debug enabled")
-                arDebug("AutoRespawnEnabled=" .. tostring(AutoRespawnEnabled))
+                arDebug("AutoRespawnEnabled=" .. tostring(AutoRespawn.Enabled))
             end
         end
     })
@@ -2766,22 +3272,26 @@ end
 --                                 ESP SUITE                                  --
 -- ========================================================================= --
 local ESP = {
-    ShowBox        = false,
-    ShowHealth     = false,
-    ShowStamina    = false,
-    ShowTracer     = false,
-    ShowInfo       = false,
-    ShowHighlight  = false,
-    MaxDistance    = 200,
-    BoxColor       = Color3.fromRGB(255, 255, 255),
-    TracerColor    = Color3.fromRGB(255, 255, 255),
-    InfoColor      = Color3.fromRGB(255, 255, 255),
-    HighlightColor = Color3.fromRGB(255, 60, 60),
-    Generation     = 0,
+    ShowBox          = false,
+    ShowHealth       = false,
+    ShowStamina      = false,
+    ShowTracer       = false,
+    ShowInfo         = false,
+    ShowHighlight    = false,
+    MaxDistance      = 200,
+    BoxColor         = Color3.fromRGB(255, 255, 255),
+    TracerColor      = Color3.fromRGB(255, 255, 255),
+    InfoColor        = Color3.fromRGB(255, 255, 255),
+    HighlightColor   = Color3.fromRGB(255, 60, 60),
+    Generation       = 0,
+    -- Internal state
+    Objects          = {},
+    Highlights       = {},
+    CharCache        = {},
+    FrameLocalRoot   = nil,
+    WorkspacePlayers = nil,
+    WorkspaceNpcs    = nil,
 }
-
-local espObjects = {}
-local espHighlights = {}
 
 local function espHasEnabledFeature()
     return ESP.ShowBox or ESP.ShowHealth or ESP.ShowStamina
@@ -2796,7 +3306,7 @@ local function espRemoveDrawing(object)
 end
 
 local function espClearDrawingFields(fields)
-    for _, objects in pairs(espObjects) do
+    for _, objects in pairs(ESP.Objects) do
         for _, field in ipairs(fields) do
             local object = objects[field]
             if object then
@@ -2809,29 +3319,27 @@ end
 
 local function espClearHighlights()
     local models = {}
-    for model, _ in pairs(espHighlights) do
+    for model, _ in pairs(ESP.Highlights) do
         table.insert(models, model)
     end
     for _, model in ipairs(models) do
-        local highlight = espHighlights[model]
+        local highlight = ESP.Highlights[model]
         if highlight then
             pcall(function()
                 highlight.Enabled = false
                 highlight:Destroy()
             end)
         end
-        espHighlights[model] = nil
+        ESP.Highlights[model] = nil
     end
 end
-
-local espCharCache = {} -- model -> { HRP, Humanoid, Head, Name }
 
 local function espGetCharacter(model)
     if not model or not model:IsA("Model") then return nil end
     if model == LocalPlayer.Character then return nil end
 
     -- Return cached refs if still valid (avoids FindFirstChild per frame)
-    local cached = espCharCache[model]
+    local cached = ESP.CharCache[model]
     if cached and cached.HRP.Parent == model and cached.Humanoid.Parent == model then
         if cached.Humanoid.Health <= 0 then return nil end
         return cached
@@ -2840,12 +3348,12 @@ local function espGetCharacter(model)
     local hrp = model:FindFirstChild("HumanoidRootPart")
     local hum = model:FindFirstChildOfClass("Humanoid")
     if not hrp or not hum or hum.Health <= 0 then
-        espCharCache[model] = nil
+        ESP.CharCache[model] = nil
         return nil
     end
 
     local data = { Model = model, HRP = hrp, Humanoid = hum, Head = model:FindFirstChild("Head"), Name = model.Name }
-    espCharCache[model] = data
+    ESP.CharCache[model] = data
     return data
 end
 
@@ -2864,24 +3372,22 @@ local function espGetHealth(character)
 end
 
 local function espClearModel(model)
-    local objs = espObjects[model]
+    local objs = ESP.Objects[model]
     if objs then
         for _, d in pairs(objs) do
             espRemoveDrawing(d)
         end
-        espObjects[model] = nil
+        ESP.Objects[model] = nil
     end
-    local hl = espHighlights[model]
+    local hl = ESP.Highlights[model]
     if hl then
         pcall(function()
             hl.Enabled = false
             hl:Destroy()
         end)
-        espHighlights[model] = nil
+        ESP.Highlights[model] = nil
     end
 end
-
-local espFrameLocalRoot = nil -- cached once per frame in espRender()
 
 local function espUpdateModel(model)
     if not espHasEnabledFeature() then
@@ -2899,7 +3405,7 @@ local function espUpdateModel(model)
     if not cam then return end
 
     -- ── Distance check (uses cached localRoot from espRender) ─────── --
-    local dist = espFrameLocalRoot and (espFrameLocalRoot.Position - char.HRP.Position).Magnitude or math.huge
+    local dist = ESP.FrameLocalRoot and (ESP.FrameLocalRoot.Position - char.HRP.Position).Magnitude or math.huge
     if dist > ESP.MaxDistance then
         espClearModel(model)
         return
@@ -2923,10 +3429,10 @@ local function espUpdateModel(model)
     local x = top.X - w / 2
     local y = top.Y
 
-    local objs = espObjects[model]
+    local objs = ESP.Objects[model]
     if not objs then
         objs = {}
-        espObjects[model] = objs
+        ESP.Objects[model] = objs
     end
 
     -- ── Box ──────────────────────────────────────────────────────── --
@@ -3061,57 +3567,54 @@ local function espUpdateModel(model)
 
     -- ── Highlight (chams) ──────────────────────────────────────────── --
     if ESP.ShowHighlight then
-        local hl = espHighlights[model]
+        local hl = ESP.Highlights[model]
         if not hl then
             hl = Instance.new("Highlight")
             hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
             hl.FillTransparency = 0.5
-            espHighlights[model] = hl
+            ESP.Highlights[model] = hl
         end
         hl.Parent = model
         hl.FillColor = ESP.HighlightColor
         hl.OutlineColor = ESP.HighlightColor
         hl.Enabled = true
     else
-        local hl = espHighlights[model]
+        local hl = ESP.Highlights[model]
         if hl then
             hl.Enabled = false
         end
     end
 end
 
-local espWorkspacePlayers = nil
-local espWorkspaceNpcs = nil
-
 local function espRender()
     if not espHasEnabledFeature() then return end
     local gen = ESP.Generation
 
     -- Cache workspace containers (rarely change)
-    if not espWorkspacePlayers or not espWorkspacePlayers.Parent then
-        espWorkspacePlayers = workspace:FindFirstChild("Players")
+    if not ESP.WorkspacePlayers or not ESP.WorkspacePlayers.Parent then
+        ESP.WorkspacePlayers = workspace:FindFirstChild("Players")
     end
-    if not espWorkspaceNpcs or not espWorkspaceNpcs.Parent then
-        espWorkspaceNpcs = workspace:FindFirstChild("NPCs")
+    if not ESP.WorkspaceNpcs or not ESP.WorkspaceNpcs.Parent then
+        ESP.WorkspaceNpcs = workspace:FindFirstChild("NPCs")
     end
 
     -- Cache local root once per frame (not per model)
     local localChar = LocalPlayer.Character
-    espFrameLocalRoot = localChar and localChar:FindFirstChild("HumanoidRootPart")
+    ESP.FrameLocalRoot = localChar and localChar:FindFirstChild("HumanoidRootPart")
 
     -- Single pass: update models + track active set
     local active = {}
 
-    if espWorkspacePlayers then
-        for _, model in espWorkspacePlayers:GetChildren() do
+    if ESP.WorkspacePlayers then
+        for _, model in ESP.WorkspacePlayers:GetChildren() do
             if ESP.Generation ~= gen then return end
             active[model] = true
             espUpdateModel(model)
         end
     end
 
-    if espWorkspaceNpcs then
-        for _, model in espWorkspaceNpcs:GetChildren() do
+    if ESP.WorkspaceNpcs then
+        for _, model in ESP.WorkspaceNpcs:GetChildren() do
             if ESP.Generation ~= gen then return end
             active[model] = true
             espUpdateModel(model)
@@ -3122,13 +3625,13 @@ local function espRender()
 
     -- Cleanup stale models (no second GetChildren needed)
     local stale = {}
-    for model, _ in pairs(espObjects) do
+    for model, _ in pairs(ESP.Objects) do
         if not active[model] then table.insert(stale, model) end
     end
     for _, model in ipairs(stale) do
         if ESP.Generation ~= gen then return end
         espClearModel(model)
-        espCharCache[model] = nil
+        ESP.CharCache[model] = nil
     end
 end
 
@@ -3212,9 +3715,8 @@ VisualTab:Divider()
 
 VisualTab:Section({ Title = "Player HUD", TextSize = 20 })
 
-local hudShowHealth = false
-local hudShowStamina = false
-local hudObjects = {}
+local HUD = { ShowHealth = false, ShowStamina = false, Objects = {}, Connections = {} }
+local AntiAfk = { Enabled = false, Conn = nil }
 
 local function hudCreateBar(yOffset)
     local bar = {}
@@ -3279,10 +3781,8 @@ local function hudRemoveBar(bar)
     end)
 end
 
-local hudConnections = {}
-
 local function hudUpdateHealth()
-    if not (hudShowHealth and hudObjects.health) then return end
+    if not (HUD.ShowHealth and HUD.Objects.health) then return end
     local char = LocalPlayer.Character
     if not char then return end
     local hum = char:FindFirstChildOfClass("Humanoid")
@@ -3291,53 +3791,53 @@ local function hudUpdateHealth()
     local color = hpPercent > 50 and Color3.fromRGB(80, 255, 80)
         or hpPercent > 25 and Color3.fromRGB(255, 200, 0)
         or Color3.fromRGB(255, 60, 60)
-    hudUpdateBar(hudObjects.health, hpPercent, color, "HP")
+    hudUpdateBar(HUD.Objects.health, hpPercent, color, "HP")
 end
 
 local function hudUpdateStamina()
-    if not (hudShowStamina and hudObjects.stamina) then return end
+    if not (HUD.ShowStamina and HUD.Objects.stamina) then return end
     local char = LocalPlayer.Character
     if not char then return end
     local stamina = math.floor(char:GetAttribute("Stamina") or 100)
     local color = stamina > 50 and Color3.fromRGB(80, 180, 255)
         or stamina > 25 and Color3.fromRGB(255, 200, 0)
         or Color3.fromRGB(255, 60, 60)
-    hudUpdateBar(hudObjects.stamina, stamina, color, "STA")
+    hudUpdateBar(HUD.Objects.stamina, stamina, color, "STA")
 end
 
 local function startHud()
     -- Disconnect old connections
-    for _, conn in ipairs(hudConnections) do conn:Disconnect() end
-    table.clear(hudConnections)
+    for _, conn in ipairs(HUD.Connections) do conn:Disconnect() end
+    table.clear(HUD.Connections)
 
-    if hudShowHealth then
-        if not hudObjects.health then hudObjects.health = hudCreateBar(-20) end
+    if HUD.ShowHealth then
+        if not HUD.Objects.health then HUD.Objects.health = hudCreateBar(-20) end
         local char = LocalPlayer.Character
         if char then
             local hum = char:FindFirstChildOfClass("Humanoid")
             if hum then
                 hudUpdateHealth()
-                table.insert(hudConnections, hum:GetPropertyChangedSignal("Health"):Connect(hudUpdateHealth))
-                table.insert(hudConnections, hum:GetPropertyChangedSignal("MaxHealth"):Connect(hudUpdateHealth))
+                table.insert(HUD.Connections, hum:GetPropertyChangedSignal("Health"):Connect(hudUpdateHealth))
+                table.insert(HUD.Connections, hum:GetPropertyChangedSignal("MaxHealth"):Connect(hudUpdateHealth))
             end
         end
     end
-    if hudShowStamina then
-        if not hudObjects.stamina then hudObjects.stamina = hudCreateBar(0) end
+    if HUD.ShowStamina then
+        if not HUD.Objects.stamina then HUD.Objects.stamina = hudCreateBar(0) end
         local char = LocalPlayer.Character
         if char then
             hudUpdateStamina()
-            table.insert(hudConnections, char:GetAttributeChangedSignal("Stamina"):Connect(hudUpdateStamina))
+            table.insert(HUD.Connections, char:GetAttributeChangedSignal("Stamina"):Connect(hudUpdateStamina))
         end
     end
 end
 
 local function stopHud()
-    if not hudShowHealth and not hudShowStamina then
-        for _, conn in ipairs(hudConnections) do conn:Disconnect() end
-        table.clear(hudConnections)
-        for _, bar in pairs(hudObjects) do hudRemoveBar(bar) end
-        hudObjects = {}
+    if not HUD.ShowHealth and not HUD.ShowStamina then
+        for _, conn in ipairs(HUD.Connections) do conn:Disconnect() end
+        table.clear(HUD.Connections)
+        for _, bar in pairs(HUD.Objects) do hudRemoveBar(bar) end
+        HUD.Objects = {}
     end
 end
 
@@ -3346,13 +3846,13 @@ VisualTab:Toggle({
     Description = "Health bar at bottom-center of screen",
     Default = false,
     Callback = function(value)
-        hudShowHealth = value
+        HUD.ShowHealth = value
         if value then
-            if not hudObjects.health then hudObjects.health = hudCreateBar(-20) end
+            if not HUD.Objects.health then HUD.Objects.health = hudCreateBar(-20) end
             startHud()
         else
-            hudRemoveBar(hudObjects.health)
-            hudObjects.health = nil
+            hudRemoveBar(HUD.Objects.health)
+            HUD.Objects.health = nil
             stopHud()
         end
     end
@@ -3363,25 +3863,22 @@ VisualTab:Toggle({
     Description = "Stamina bar at bottom-center of screen",
     Default = false,
     Callback = function(value)
-        hudShowStamina = value
+        HUD.ShowStamina = value
         if value then
-            if not hudObjects.stamina then hudObjects.stamina = hudCreateBar(0) end
+            if not HUD.Objects.stamina then HUD.Objects.stamina = hudCreateBar(0) end
             startHud()
         else
-            hudRemoveBar(hudObjects.stamina)
-            hudObjects.stamina = nil
+            hudRemoveBar(HUD.Objects.stamina)
+            HUD.Objects.stamina = nil
             stopHud()
         end
     end
 })
 
 
-local AntiAfkEnabled = false
-local antiAfkConnection = nil
-
 local function startAntiAfk()
-    if antiAfkConnection then return end
-    antiAfkConnection = LocalPlayer.Idled:Connect(function()
+    if AntiAfk.Conn then return end
+    AntiAfk.Conn = LocalPlayer.Idled:Connect(function()
         VirtualUser:Button2Down(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
         task.wait(1)
         VirtualUser:Button2Up(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
@@ -3389,9 +3886,9 @@ local function startAntiAfk()
 end
 
 local function stopAntiAfk()
-    if antiAfkConnection then
-        antiAfkConnection:Disconnect()
-        antiAfkConnection = nil
+    if AntiAfk.Conn then
+        AntiAfk.Conn:Disconnect()
+        AntiAfk.Conn = nil
     end
 end
 
@@ -3408,12 +3905,78 @@ MiscTab:Toggle({
     end
 })
 
+MiscTab:Dropdown({
+    Title = "Timing Mode",
+    Description = "Always Perfect = hit every note perfectly | Custom Mix = random PERFECT/GOOD/OK/BAD",
+    Flag = "RhythmTimingMode",
+    Values = { "Always Perfect", "Custom Mix" },
+    Value = "Always Perfect",
+    Callback = function(value)
+        Rhythm.Mode = value == "Custom Mix" and "custom" or "perfect"
+    end
+})
+
+MiscTab:Slider({
+    Title = "Press Lead (ms)",
+    Description = "Extra milliseconds to press early (0 = exact timing)",
+    Flag = "RhythmPressLead",
+    Value = { Min = 0, Max = 100, Default = 0 },
+    Step = 5,
+    Callback = function(value)
+        Rhythm.PressLeadMs = value
+    end
+})
+
+MiscTab:Slider({
+    Title = "Hold Extend (ms)",
+    Description = "Extra milliseconds to hold long notes (default 80)",
+    Flag = "RhythmHoldExtend",
+    Value = { Min = 0, Max = 300, Default = 80 },
+    Step = 10,
+    Callback = function(value)
+        Rhythm.HoldExtendMs = value
+    end
+})
+
+MiscTab:Slider({
+    Title = "PERFECT %",
+    Description = "Custom Mix: chance of PERFECT hit per note",
+    Flag = "RhythmPerfectChance",
+    Value = { Min = 0, Max = 100, Default = 70 },
+    Step = 5,
+    Callback = function(value)
+        Rhythm.PerfectChance = value
+    end
+})
+
+MiscTab:Slider({
+    Title = "GOOD %",
+    Description = "Custom Mix: chance of GOOD hit per note",
+    Flag = "RhythmGoodChance",
+    Value = { Min = 0, Max = 100, Default = 25 },
+    Step = 5,
+    Callback = function(value)
+        Rhythm.GoodChance = value
+    end
+})
+
+MiscTab:Slider({
+    Title = "OK %",
+    Description = "Custom Mix: chance of OK hit per note (rest = BAD)",
+    Flag = "RhythmOkChance",
+    Value = { Min = 0, Max = 100, Default = 5 },
+    Step = 5,
+    Callback = function(value)
+        Rhythm.OkChance = value
+    end
+})
+
 MiscTab:Toggle({
     Title = "Anti AFK",
     Description = "Prevent auto-kick by simulating input when idle",
     Default = false,
     Callback = function(value)
-        AntiAfkEnabled = value
+        AntiAfk.Enabled = value
         if value then
             startAntiAfk()
         else
@@ -3427,13 +3990,8 @@ MiscTab:Toggle({
 --                             SERVER INFORMATION                             --
 -- -------------------------------------------------------------------------- --
 
-local placeId = game.PlaceId
-local jobId = game.JobId
-local TeleportService = game:GetService("TeleportService")
-local HttpService = game:GetService("HttpService")
-
 local function getServerLink()
-    return string.format("https://www.roblox.com/games/start?placeId=%d&jobId=%s", placeId, jobId)
+    return string.format("https://www.roblox.com/games/start?placeId=%d&jobId=%s", game.PlaceId, game.JobId)
 end
 
 local ServerTab = Window:Tab({ Icon = "server", Title = "Server" })
@@ -3443,12 +4001,12 @@ ServerTab:Divider()
 
 ServerTab:Paragraph({
     Title = "Server ID",
-    Desc = jobId
+    Desc = game.JobId
 })
 
 ServerTab:Paragraph({
     Title = "Place ID",
-    Desc = tostring(placeId)
+    Desc = tostring(game.PlaceId)
 })
 
 ServerTab:Divider()
@@ -3480,7 +4038,7 @@ ServerTab:Button({
     Desc = "Rejoin the current server",
     Icon = "refresh-cw",
     Callback = function()
-        TeleportService:Teleport(game.PlaceId, LocalPlayer)
+        game:GetService("TeleportService"):Teleport(game.PlaceId, LocalPlayer)
     end
 })
 
@@ -3491,8 +4049,8 @@ ServerTab:Button({
     Icon = "shuffle",
     Callback = function()
         local success, servers = pcall(function()
-            return HttpService:JSONDecode(game:HttpGet("https://games.roblox.com/v1/games/" ..
-                placeId .. "/servers/Public?sortOrder=Asc&limit=100"))
+            return game:GetService("HttpService"):JSONDecode(game:HttpGet("https://games.roblox.com/v1/games/" ..
+                game.PlaceId .. "/servers/Public?sortOrder=Asc&limit=100"))
         end)
         if success and servers and servers.data and #servers.data > 0 then
             local filteredServers = {}
@@ -3501,7 +4059,7 @@ ServerTab:Button({
             end
             if #filteredServers > 0 then
                 local randomServer = filteredServers[math.random(1, #filteredServers)]
-                TeleportService:TeleportToPlaceInstance(placeId, randomServer.id, LocalPlayer)
+                game:GetService("TeleportService"):TeleportToPlaceInstance(game.PlaceId, randomServer.id, LocalPlayer)
             else
                 WindUI:Notify({ Title = "Server Hop Failed", Content = "No servers with 5+ players found!", Duration = 3 })
             end
@@ -3517,13 +4075,13 @@ ServerTab:Button({
     Icon = "minimize",
     Callback = function()
         local success, servers = pcall(function()
-            return HttpService:JSONDecode(game:HttpGet("https://games.roblox.com/v1/games/" ..
-                placeId .. "/servers/Public?sortOrder=Asc&limit=100"))
+            return game:GetService("HttpService"):JSONDecode(game:HttpGet("https://games.roblox.com/v1/games/" ..
+                game.PlaceId .. "/servers/Public?sortOrder=Asc&limit=100"))
         end)
         if success and servers and servers.data and #servers.data > 0 then
             table.sort(servers.data, function(a, b) return a.playing < b.playing end)
             if servers.data[1] then
-                TeleportService:TeleportToPlaceInstance(placeId, servers.data[1].id, LocalPlayer)
+                game:GetService("TeleportService"):TeleportToPlaceInstance(game.PlaceId, servers.data[1].id, LocalPlayer)
             end
         else
             WindUI:Notify({ Title = "Server Hop Failed", Content = "Could not fetch servers!", Duration = 3 })
