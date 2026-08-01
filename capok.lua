@@ -13,7 +13,7 @@ local GuiService          = game:GetService("GuiService")
 -- ========================================================================= --
 --                                 DEV FLAGS                                   --
 -- ========================================================================= --
-local DEBUG_TAB_ENABLED   = false -- set to false before publishing
+local DEBUG_TAB_ENABLED   = true -- set to false before publishing
 local AR_DEBUG            = false
 local AR_DEBUG_TIMELINE   = {}
 
@@ -2376,7 +2376,7 @@ end)
 -- ========================================================================= --
 local AutoParryTab = Window:Tab({ Title = "Combat", Icon = "shield" })
 
--- ── Enable/Disable ────────────────────────────────────────────────────── --4
+-- ── Enable/Disable ────────────────────────────────────────────────────── --
 AutoParryTab:Section({ Title = "Auto Parry", TextSize = 20 })
 
 AutoParryTab:Toggle({
@@ -2499,26 +2499,7 @@ AutoParryTab:Toggle({
     end
 })
 
-AutoParryTab:Section({ Title = "Custom Auto Parry", TextSize = 20 })
-
-AutoParryTab:Toggle({
-    Title = "Auto Parry",
-    Description = "Briefly tap block when a nearby enemy swings",
-    Default = false,
-    Callback = function(Value)
-        AutoParry.Enabled = Value
-        if Value then
-            debugLog("[BagahHub STATE]", "Auto Parry enabled")
-            notify("🛡️ Auto Parry", "ON - timed parry enabled", 2)
-        else
-            debugLog("[BagahHub STATE]", "Auto Parry disabled")
-            AutoParry.ParryToken += 1
-            AutoParry.PendingParry = {}
-            releaseBlock()
-        end
-    end
-})
-
+AutoParryTab:Section({ Title = "Parry Settings", TextSize = 20 })
 
 -- ── Timing ────────────────────────────────────────────────────────────── --
 AutoParryTab:Slider({
