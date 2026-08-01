@@ -71,6 +71,11 @@ local AutoParry            = {
     PingAdjustPercent = 100,
     SmoothedPing = 0,
     LastPingSample = 0,
+    -- Fallback safety block: hold block when parry isn't possible
+    FallbackBlockEnabled = false,
+    FallbackBlockDuration = 0.45,
+    FallbackBlockRange = 12,
+    LastFallbackBlock = 0,
 }
 
 local PERFECT_PARRY_CONFIG = {
@@ -83,21 +88,52 @@ local PERFECT_PARRY_CONFIG = {
     MaxSyncCorrection = 0.12,
 }
 
+-- ── Per-combat-style impact timing ─────────────────────────────────────── --
+-- Seconds from animation start to the hit actually landing, per style.
+-- Key = lowercase style-folder fragment found in the registry path
+-- (e.g. "boxing" matches ReplicatedStorage.Animations.Combat.BoxingAnims...).
+-- `m1` = lead/reach attacks (1st/4th M1), `chain` = fast chain hits (2nd/3rd M1).
+-- Tune these per style; faster styles need smaller values.
+local STYLE_IMPACT_TIMES   = {
+    boxing    = { m1 = 0.30, chain = 0.32 }, -- fast punches
+    striker   = { m1 = 0.34, chain = 0.35 }, -- fast strikes
+    kure      = { m1 = 0.34, chain = 0.36 }, -- fast assassination style
+    karate    = { m1 = 0.38, chain = 0.39 }, -- disciplined, medium
+    capoeira  = { m1 = 0.40, chain = 0.41 }, -- spinning kicks
+    hakari    = { m1 = 0.40, chain = 0.42 }, -- medium
+    basic     = { m1 = 0.42, chain = 0.40 }, -- baseline default
+    muaythai  = { m1 = 0.45, chain = 0.44 }, -- heavy kicks / elbows
+    wrestling = { m1 = 0.48, chain = 0.46 }, -- grappling, slow
+    slugger   = { m1 = 0.50, chain = 0.48 }, -- heavy haymakers
+}
+
+-- Returns the style key for a registry path, or nil if unknown/base.
+local function getCombatStyleFromPath(lowerPath)
+    for style in STYLE_IMPACT_TIMES do
+        if string.find(lowerPath, style, 1, true) then
+            return style
+        end
+    end
+    return nil
+end
+
 local function getPerfectDefaultImpactTime(registryPath)
     local lowerPath = string.lower(registryPath)
     if string.find(lowerPath, "m2", 1, true) then
         return PERFECT_PARRY_CONFIG.M2ImpactTime
     end
-    -- Boxing style has shorter windup
-    if string.find(lowerPath, "boxing", 1, true) then
-        if string.find(lowerPath, "2ndm1", 1, true)
-            or string.find(lowerPath, "3rdm1", 1, true) then
-            return 0.32
-        end
-        return 0.30
+    local isChain = string.find(lowerPath, "2ndm1", 1, true)
+        or string.find(lowerPath, "3rdm1", 1, true)
+
+    -- Style-specific timing (covers Boxing, Karate, MuayThai, Slugger, etc.)
+    local style = getCombatStyleFromPath(lowerPath)
+    if style then
+        local timing = STYLE_IMPACT_TIMES[style]
+        return isChain and timing.chain or timing.m1
     end
-    if string.find(lowerPath, "2ndm1", 1, true)
-        or string.find(lowerPath, "3rdm1", 1, true) then
+
+    -- Unknown / base style fallback
+    if isChain then
         return 0.40
     end
     if string.find(lowerPath, "1stm1", 1, true)
@@ -462,6 +498,32 @@ local function tapParry(attackerName, delay, holdTime, minDelay)
             AutoParry.BlockM1Active = false
             releaseBlock(blockToken)
         end)
+    end)
+end
+
+-- ── Fallback Safety Block ─────────────────────────────────────────────── --
+-- When a real parry can't be scheduled (out of range, facing-check fail,
+-- cooldown, etc.) but an attack is incoming, hold block briefly so the
+-- character still mitigates damage instead of eating it raw.
+local function fallbackBlock(attackerName)
+    if not AutoParry.FallbackBlockEnabled then return end
+    if not isAnyAutoParryEnabled() then return end
+    -- Don't override an active parry/block window
+    if AutoParry.IsBlocking then return end
+    local now = os.clock()
+    if now - AutoParry.LastFallbackBlock < 0.35 then return end
+    -- Only bother if the attacker is within fallback range
+    if getAttackerDistance(attackerName) > AutoParry.FallbackBlockRange then return end
+
+    AutoParry.LastFallbackBlock = now
+    faceAttacker(attackerName)
+    local blockToken = holdBlock()
+    if DEBUG_EVENTS then
+        debugLog("[BagahHub FALLBACK]", "safety block", "| attacker:", attackerName,
+            "| hold:", AutoParry.FallbackBlockDuration)
+    end
+    task.delay(AutoParry.FallbackBlockDuration, function()
+        releaseBlock(blockToken)
     end)
 end
 
