@@ -79,7 +79,7 @@ local PERFECT_PARRY_CONFIG = {
     MaxDistance = 18,
     M1ImpactTime = 0.42,
     M2ImpactTime = 0.61,
-    InputLead = 0.06,
+    InputLead = 0.09,
     MaxSyncCorrection = 0.12,
 }
 
@@ -87,6 +87,14 @@ local function getPerfectDefaultImpactTime(registryPath)
     local lowerPath = string.lower(registryPath)
     if string.find(lowerPath, "m2", 1, true) then
         return PERFECT_PARRY_CONFIG.M2ImpactTime
+    end
+    -- Boxing style has shorter windup
+    if string.find(lowerPath, "boxing", 1, true) then
+        if string.find(lowerPath, "2ndm1", 1, true)
+            or string.find(lowerPath, "3rdm1", 1, true) then
+            return 0.32
+        end
+        return 0.30
     end
     if string.find(lowerPath, "2ndm1", 1, true)
         or string.find(lowerPath, "3rdm1", 1, true) then
@@ -102,6 +110,13 @@ end
 local function isAnyAutoParryEnabled()
     return AutoParry.Enabled or AutoParry.PerfectEnabled
 end
+
+-- ── Mobile detection: auto-compensate for lower FPS / scheduler jitter ── --
+local IsMobileDevice = UserInputService.TouchEnabled
+    and not UserInputService.MouseEnabled
+    and not UserInputService.KeyboardEnabled
+-- Extra lead (seconds) added on mobile to counter task.delay granularity
+local MOBILE_EXTRA_LEAD = IsMobileDevice and 0.04 or 0
 
 local function getNetworkOneWayTime()
     local now = os.clock()
@@ -672,7 +687,7 @@ local function watchCharacter(character)
                     local impactTime = AutoParry.LearnedImpactTime[animationId]
                         or getPerfectDefaultImpactTime(registryPath)
                     local parryDelay = impactTime - PERFECT_PARRY_CONFIG.InputLead
-                        - getNetworkOneWayTime() - correction
+                        - MOBILE_EXTRA_LEAD - getNetworkOneWayTime() - correction
                     if DEBUG_EVENTS then
                         debugLog("[BagahHub SYNC]", animationId,
                             "| enabled:", AutoParry.AnimationSyncEnabled,
@@ -687,12 +702,10 @@ local function watchCharacter(character)
                 end
 
                 if AutoParry.AnimationSyncEnabled then
-                    task.spawn(function()
-                        RunService.Heartbeat:Wait()
-                        local elapsed = os.clock() - attackStartedAt
-                        local syncCorrection, syncValid = getAnimationSyncCorrection(track)
-                        schedulePerfect(syncValid and syncCorrection or elapsed, syncValid)
-                    end)
+                    -- Read TimePosition immediately (no Heartbeat:Wait, saves 1 frame on mobile)
+                    local elapsed = os.clock() - attackStartedAt
+                    local syncCorrection, syncValid = getAnimationSyncCorrection(track)
+                    schedulePerfect(syncValid and syncCorrection or elapsed, syncValid)
                 else
                     schedulePerfect(0, false)
                 end
@@ -700,7 +713,7 @@ local function watchCharacter(character)
                 local impactTime = AutoParry.LearnedImpactTime[animationId]
                     or AutoParry.DefaultImpactTime
                 local parryDelay = math.max(AutoParry.MinParryDelay,
-                    impactTime - AutoParry.ImpactLead)
+                    impactTime - AutoParry.ImpactLead - MOBILE_EXTRA_LEAD)
                 tapParry(character.Name, parryDelay)
             end
         end)
@@ -1042,6 +1055,54 @@ end
 -- ========================================================================= --
 --                             DEBUG COPY UTILITY                              --
 -- ========================================================================= --
+
+-- ── Upload debug logs to a free paste service (paste.rs) ──────────────── --
+-- Uses the executor's HTTP function. Prints the paste URL + copies to clipboard.
+local function uploadDebugLogs(text)
+    -- Safely resolve whichever HTTP function the executor exposes
+    local env = getfenv and getfenv() or _G
+    local httpFn = (typeof(request) == "function" and request)
+        or (typeof(http_request) == "function" and http_request)
+        or (typeof(syn) == "table" and syn.request)
+        or (rawget(env, "http") and rawget(env, "http").request)
+
+    if not httpFn then
+        warn("[BagahHub UPLOAD] No executor HTTP function available (request/http_request)")
+        return
+    end
+
+    print("[BagahHub UPLOAD] Uploading debug logs to paste.rs ...")
+
+    task.spawn(function()
+        local ok, res = pcall(function()
+            return httpFn({
+                Url = "https://paste.rs/",
+                Method = "POST",
+                Headers = { ["Content-Type"] = "text/plain" },
+                Body = text,
+            })
+        end)
+
+        if not ok or not res then
+            warn("[BagahHub UPLOAD] Upload failed:", res or "no response")
+            return
+        end
+
+        local body = res.Body or ""
+        if res.StatusCode == 200 or res.StatusCode == 201 then
+            local url = body:match("https?://%S+") or body
+            print("[BagahHub UPLOAD] ✅ Debug log uploaded:", url)
+            if typeof(setclipboard) == "function" then
+                setclipboard(url)
+                print("[BagahHub UPLOAD] URL copied to clipboard")
+            end
+            if notify then notify("📤 Debug Uploaded", url, 6) end
+        else
+            warn("[BagahHub UPLOAD] Server returned", res.StatusCode, body)
+        end
+    end)
+end
+
 local function copyActiveDebugLogs()
     local reports = {}
     if DEBUG_EVENTS then
@@ -1076,6 +1137,8 @@ local function copyActiveDebugLogs()
     else
         warn("[BagahHub] Executor does not provide setclipboard")
     end
+
+    uploadDebugLogs(output)
 end
 
 UserInputService.InputBegan:Connect(function(input, gameProcessed)
