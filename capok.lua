@@ -1079,7 +1079,7 @@ local Rhythm    = {
     DebugStartedAt = os.clock(),
     LastMissingRootDebug = 0,
     -- ── Internal state (moved from locals to save upvalue slots) ─────
-    BuildId = "rhythm-notetime-20260802-5",
+    BuildId = "rhythm-notetime-20260802-6",
     Connections = {},
     ManualTouchStarted = {},
     DebugRootReported = nil,
@@ -2292,33 +2292,21 @@ local function rhythmDebugAndroidHierarchy()
         matched > 300 and "truncated=300" or "complete")
 end
 
--- ── Timing offset: mode-based press timing ────────────────────────────
--- task.delay fires on next frame boundary → adds ~16ms latency at 60fps.
--- We compensate by pressing slightly early (Rhythm.TaskDelayComp).
-
-local function rhythmGetTimingOffset()
-    -- Returns lead time in seconds (positive = press before note reaches receptor)
-    local baseLead = Rhythm.PressLeadMs / 1000 + Rhythm.TaskDelayComp
-    -- Touch input has inherent latency, needs extra base lead
-    if Rhythm.TouchMode then
-        baseLead = baseLead + (Rhythm.LaneCount >= 4 and 0.035 or Rhythm.TouchLeadTime)
-    end
+-- ── Timing mode: returns delay before press (0 = immediate) ───────────
+local function rhythmGetCustomDelay()
     if Rhythm.Mode == "perfect" then
-        return baseLead
+        return 0
     end
-    -- Custom mode: roll probability → PERFECT / GOOD / OK / BAD
     local roll = math.random(1, 100)
-    local offset
     if roll <= Rhythm.PerfectChance then
-        offset = 0                             -- PERFECT: exact
+        return 0
     elseif roll <= Rhythm.PerfectChance + Rhythm.GoodChance then
-        offset = (math.random() - 0.5) * 0.030 -- GOOD: ±15ms
+        return math.random() * 0.025 + 0.005
     elseif roll <= Rhythm.PerfectChance + Rhythm.GoodChance + Rhythm.OkChance then
-        offset = (math.random() - 0.5) * 0.060 -- OK: ±30ms
+        return math.random() * 0.040 + 0.025
     else
-        offset = (math.random() - 0.5) * 0.100 -- BAD: ±50ms
+        return math.random() * 0.060 + 0.050
     end
-    return baseLead + offset
 end
 
 local function rhythmCalibrateScrollSpeed(note, data, now, noteY)
@@ -2332,7 +2320,9 @@ local function rhythmCalibrateScrollSpeed(note, data, now, noteY)
                 if #Rhythm.ScrollSpeedSamples > 60 then
                     table.remove(Rhythm.ScrollSpeedSamples, 1)
                 end
-                if #Rhythm.ScrollSpeedSamples >= 5 then
+                Rhythm.ScrollSpeedDirty = (Rhythm.ScrollSpeedDirty or 0) + 1
+                if #Rhythm.ScrollSpeedSamples >= 5 and Rhythm.ScrollSpeedDirty >= 5 then
+                    Rhythm.ScrollSpeedDirty = 0
                     local sorted = {}
                     for _, s in ipairs(Rhythm.ScrollSpeedSamples) do
                         table.insert(sorted, s)
@@ -2414,42 +2404,68 @@ local function rhythmStep()
                         table.insert(songTimeVotes, songTime)
                     end
 
-                    if timeToHit and timeToHit <= 0.016 and timeToHit >= -0.080
+                    if timeToHit and timeToHit <= 0.005 and timeToHit >= -0.080
                         and now - (Rhythm.LastPress[data.lane] or 0) >= Rhythm.MinInterval then
                         data.pressed = true
                         Rhythm.LastPress[data.lane] = now
                         Rhythm.LastPressAt[data.lane] = now
                         local scheduledHold = data.isHold and data.holdDuration or nil
                         local generation = Rhythm.Generation
+                        local customDelay = rhythmGetCustomDelay()
                         rhythmDebug("HIT", "lane=", data.lane, "noteTime=", string.format("%.4f", noteTime),
                             "timeToHit=", string.format("%.4f", timeToHit),
                             "scrollSpeed=", string.format("%.1f", Rhythm.ScrollSpeed),
-                            "hold=", scheduledHold ~= nil, "immediate=true")
-                        if scheduledHold then
-                            rhythmHoldUntilTail(note, receptor, data.lane, data.key,
-                                scheduledHold, generation)
+                            "hold=", scheduledHold ~= nil, "customDelay=", string.format("%.4f", customDelay))
+                        if customDelay <= 0 then
+                            if scheduledHold then
+                                rhythmHoldUntilTail(note, receptor, data.lane, data.key,
+                                    scheduledHold, generation)
+                            else
+                                rhythmTap(data.lane, data.key)
+                            end
                         else
-                            rhythmTap(data.lane, data.key)
+                            task.delay(customDelay, function()
+                                if not Rhythm.Enabled or generation ~= Rhythm.Generation then return end
+                                if scheduledHold then
+                                    rhythmHoldUntilTail(note, receptor, data.lane, data.key,
+                                        scheduledHold, generation)
+                                else
+                                    rhythmTap(data.lane, data.key)
+                                end
+                            end)
                         end
                     end
                 elseif frameVelocity and frameVelocity > 1 then
                     local eta = (receptorY - noteY) / frameVelocity
-                    if eta <= 0.016 and eta >= -0.080
+                    if eta <= 0.005 and eta >= -0.080
                         and now - (Rhythm.LastPress[data.lane] or 0) >= Rhythm.MinInterval then
                         data.pressed = true
                         Rhythm.LastPress[data.lane] = now
                         Rhythm.LastPressAt[data.lane] = now
                         local scheduledHold = data.isHold and data.holdDuration or nil
                         local generation = Rhythm.Generation
+                        local customDelay = rhythmGetCustomDelay()
                         rhythmDebug("HIT", "lane=", data.lane, "eta=", string.format("%.4f", eta),
                             "velocity=", string.format("%.2f", frameVelocity), "hold=", scheduledHold ~= nil,
                             "noteY=", string.format("%.1f", noteY), "targetY=", string.format("%.1f", receptorY),
-                            "immediate=true")
-                        if scheduledHold then
-                            rhythmHoldUntilTail(note, receptor, data.lane, data.key,
-                                scheduledHold, generation)
+                            "customDelay=", string.format("%.4f", customDelay))
+                        if customDelay <= 0 then
+                            if scheduledHold then
+                                rhythmHoldUntilTail(note, receptor, data.lane, data.key,
+                                    scheduledHold, generation)
+                            else
+                                rhythmTap(data.lane, data.key)
+                            end
                         else
-                            rhythmTap(data.lane, data.key)
+                            task.delay(customDelay, function()
+                                if not Rhythm.Enabled or generation ~= Rhythm.Generation then return end
+                                if scheduledHold then
+                                    rhythmHoldUntilTail(note, receptor, data.lane, data.key,
+                                        scheduledHold, generation)
+                                else
+                                    rhythmTap(data.lane, data.key)
+                                end
+                            end)
                         end
                     end
                 end
