@@ -14,6 +14,7 @@ local GuiService          = game:GetService("GuiService")
 --                                 DEV FLAGS                                   --
 -- ========================================================================= --
 local DEBUG_TAB_ENABLED   = true -- set to false before publishing
+local NO_UI_TEST_MODE     = false
 
 -- ========================================================================= --
 --                                  REMOTES                                   --
@@ -194,6 +195,9 @@ local Dbg = {
     StunStartedAt = os.clock(),
 }
 
+local EspHealthDebug = { Enabled = false, LastState = {}, Timeline = {} }
+local HudHealthDebug = { Enabled = false, LastState = nil, Timeline = {} }
+
 local RuntimeProfiler = {
     Enabled = false,
     Conn = nil,
@@ -222,6 +226,10 @@ local function resetRuntimeProfileCounters()
     RuntimeProfiler.RhythmFrames = 0
     RuntimeProfiler.RhythmTime = 0
     RuntimeProfiler.Namecalls = 0
+    RuntimeProfiler.ParryScheduled = 0
+    RuntimeProfiler.ParryTriggered = 0
+    RuntimeProfiler.ParryTriggeredPlannedTime = 0
+    RuntimeProfiler.ParryActualTime = 0
 end
 
 local function stopRuntimeProfiler()
@@ -266,17 +274,38 @@ local function startRuntimeProfiler()
             and RuntimeProfiler.Frames / RuntimeProfiler.FrameTime or 0
         local renderFps = RuntimeProfiler.RenderFrameTime > 0
             and RuntimeProfiler.RenderFrames / RuntimeProfiler.RenderFrameTime or 0
+        local plannedParryMs = RuntimeProfiler.ParryTriggered > 0
+            and RuntimeProfiler.ParryTriggeredPlannedTime / RuntimeProfiler.ParryTriggered * 1000 or 0
+        local actualParryMs = RuntimeProfiler.ParryTriggered > 0
+            and RuntimeProfiler.ParryActualTime / RuntimeProfiler.ParryTriggered * 1000 or 0
         RuntimeProfiler.LastReport = string.format(
-            "[BagahHub PROFILE] %.1fs | sim %.1fFPS %.1fms/%d | render %.1fFPS %.1fms/%d | combat %d | anim %d/%d/%d | face %d | ESP %d %.2fms | rhythm %d %.2fms | namecalls %d",
+            "[BagahHub PROFILE] %.1fs | sim %.1fFPS %.1fms/%d | render %.1fFPS %.1fms/%d | combat %d | anim %d/%d/%d | parry %d/%d %.1f/%.1fms | face %d | ESP %d %.2fms | rhythm %d %.2fms | namecalls %d",
             elapsed, fps, RuntimeProfiler.MaxFrameTime * 1000, RuntimeProfiler.Hitches,
             renderFps, RuntimeProfiler.RenderMaxFrameTime * 1000, RuntimeProfiler.RenderHitches,
             RuntimeProfiler.CombatEvents, RuntimeProfiler.RelevantAnimations,
-            RuntimeProfiler.AnimationEvents, RuntimeProfiler.WatchedAnimations, RuntimeProfiler.FaceLockTicks,
+            RuntimeProfiler.AnimationEvents, RuntimeProfiler.WatchedAnimations,
+            RuntimeProfiler.ParryTriggered, RuntimeProfiler.ParryScheduled, plannedParryMs, actualParryMs,
+            RuntimeProfiler.FaceLockTicks,
             RuntimeProfiler.EspFrames, RuntimeProfiler.EspTime * 1000,
             RuntimeProfiler.RhythmFrames, RuntimeProfiler.RhythmTime * 1000,
             RuntimeProfiler.Namecalls)
         RuntimeProfiler.LastReportAt = now
         resetRuntimeProfileCounters()
+    end)
+end
+
+if NO_UI_TEST_MODE then
+    UserInputService.InputBegan:Connect(function(input, processed)
+        if processed then return end
+        if input.KeyCode == Enum.KeyCode.F7 then
+            if RuntimeProfiler.Enabled then
+                stopRuntimeProfiler()
+            else
+                startRuntimeProfiler()
+            end
+        elseif input.KeyCode == Enum.KeyCode.F8 then
+            pcall(function() setclipboard(RuntimeProfiler.LastReport) end)
+        end
     end)
 end
 
@@ -564,10 +593,14 @@ end
 
 local function tapParry(attackerName, delay, holdTime, minDelay)
     local now = os.clock()
-    if now - (AutoParry.LastSwing[attackerName] or 0) < 0.15 then return end
+    if now - (AutoParry.LastSwing[attackerName] or 0) < 0.15 then
+        if Dbg.Events then debugLog("[BagahHub SKIP]", attackerName, "cooldown") end
+        return
+    end
 
     -- Facing Check: skip if attacker isn't facing us
     if AutoParry.FacingCheckEnabled and not isAttackerFacingMe(attackerName) then
+        if Dbg.Events then debugLog("[BagahHub SKIP]", attackerName, "facing check") end
         return
     end
 
@@ -576,6 +609,9 @@ local function tapParry(attackerName, delay, holdTime, minDelay)
     local scheduledAt = now
     local parryDelay = math.max(minDelay or AutoParry.MinParryDelay,
         delay or (AutoParry.DefaultImpactTime - AutoParry.ImpactLead))
+    if RuntimeProfiler.Enabled then
+        RuntimeProfiler.ParryScheduled += 1
+    end
     AutoParry.PendingParry[attackerName] = scheduledAt
     faceAttacker(attackerName)
 
@@ -591,6 +627,11 @@ local function tapParry(attackerName, delay, holdTime, minDelay)
             return
         end
         AutoParry.PendingParry[attackerName] = nil
+        if RuntimeProfiler.Enabled then
+            RuntimeProfiler.ParryTriggered += 1
+            RuntimeProfiler.ParryTriggeredPlannedTime += parryDelay
+            RuntimeProfiler.ParryActualTime += os.clock() - scheduledAt
+        end
         faceAttacker(attackerName)
         local blockToken = holdBlock()
         AutoParry.TotalParries += 1
@@ -925,10 +966,12 @@ end
 
 local function refreshAnimationWatchers()
     if isAnyAutoParryEnabled() or AutoParry.GrappleAwareEnabled then
-        local container = workspace:FindFirstChild("Players")
-        if container then
-            for _, character in container:GetChildren() do
-                watchCharacter(character)
+        for _, containerName in ipairs({ "Players", "NPCs" }) do
+            local container = workspace:FindFirstChild(containerName)
+            if container then
+                for _, character in container:GetChildren() do
+                    watchCharacter(character)
+                end
             end
         end
         return
@@ -940,6 +983,13 @@ local function refreshAnimationWatchers()
 end
 
 watchContainer(workspace:WaitForChild("Players", 10))
+watchContainer(workspace:WaitForChild("NPCs", 10))
+
+-- Start default combat detection before loading the UI so early attacks are not missed.
+AutoParry.PerfectEnabled = true
+AutoParry.AnimationSyncEnabled = true
+AutoParry.FacingEnabled = true
+refreshAnimationWatchers()
 
 for _, player in Players:GetPlayers() do
     if player ~= LocalPlayer and player.Character then watchCharacter(player.Character) end
@@ -1106,32 +1156,152 @@ LocalPlayer.CharacterAdded:Connect(function(_character)
 end)
 
 -- ========================================================================= --
-local WindUI = loadstring(game:HttpGet("https://raw.githubusercontent.com/Footagesus/WindUI/main/dist/main.lua"))()
-WindUI.TransparencyValue = 0.2
-WindUI:SetTheme("Crimson")
+local Library = loadstring(game:HttpGet(
+    "https://raw.githubusercontent.com/deividcomsono/Obsidian/refs/heads/main/Library.lua"))()
+local SaveManager = loadstring(game:HttpGet(
+    "https://raw.githubusercontent.com/deividcomsono/Obsidian/refs/heads/main/addons/SaveManager.lua"))()
+Library.ForceCheckbox = false
+Library.ShowToggleFrameInKeybinds = true
 
-local Window = WindUI:CreateWindow({
+local ObsidianWindow = Library:CreateWindow({
     Title = "Bagah Hub - Gakuran",
-    Icon = "sprout",
-    Author = "Made by : Bagah Project",
-    Folder = "BagahHubGakuran",
-    Size = UDim2.fromOffset(450, 400),
-    Theme = "Crimson",
-    HidePanelBackground = false,
-    Acrylic = false,
-    HideSearchBar = false,
-    SideBarWidth = 180,
-})
-Window:Tag({
-    Title = "BETA",
-    Color = Color3.fromHex("#FF00FF")
+    Footer = "Bagah Project | v0.0.2",
+    NotifySide = "Right",
+    ShowCustomCursor = false,
 })
 
-Window:Tag({
-    Title = "V0.0.1",
-    Color = Color3.fromHex("#FF9500")
-})
+local controlIndex = 0
+local function nextControlIndex(prefix)
+    controlIndex += 1
+    return prefix .. controlIndex
+end
 
+local function getEspHealthDebugOutput()
+    return table.concat({
+        "BagahHub ESP Health Debug",
+        "Copied: " .. os.date("!%Y-%m-%dT%H:%M:%SZ"),
+        "--- TIMELINE ---",
+        table.concat(EspHealthDebug.Timeline, "\n"),
+    }, "\n")
+end
+
+local function getHudHealthDebugOutput()
+    return table.concat({
+        "BagahHub Player HUD Health Debug",
+        "Copied: " .. os.date("!%Y-%m-%dT%H:%M:%SZ"),
+        "--- TIMELINE ---",
+        table.concat(HudHealthDebug.Timeline, "\n"),
+    }, "\n")
+end
+
+local function titledControlIndex(prefix, title)
+    return prefix .. tostring(title):gsub("[^%w]", "")
+end
+
+local function sliderRounding(step)
+    local decimal = tostring(step or 1):match("%.(%d+)")
+    return decimal and #decimal or 0
+end
+
+local function createAdapterTab(info)
+    local rawTab = ObsidianWindow:AddTab(info.Title, info.Icon)
+    local adapter = { Raw = rawTab, Group = nil, Left = true }
+
+    local function ensureGroup()
+        if not adapter.Group then
+            adapter.Group = rawTab:AddLeftGroupbox("General")
+        end
+        return adapter.Group
+    end
+
+    function adapter:Section(section)
+        local title = section.Title or "General"
+        self.Group = self.Left and rawTab:AddLeftGroupbox(title) or rawTab:AddRightGroupbox(title)
+        self.Left = not self.Left
+    end
+
+    function adapter:Divider()
+        ensureGroup():AddDivider()
+    end
+
+    function adapter:Toggle(options)
+        return ensureGroup():AddToggle(options.Flag or titledControlIndex("Toggle", options.Title), {
+            Text = options.Title,
+            Tooltip = options.Description or options.Desc,
+            Default = options.Default or false,
+            Callback = options.Callback,
+        })
+    end
+
+    function adapter:Slider(options)
+        local value = options.Value or {}
+        return ensureGroup():AddSlider(options.Flag or nextControlIndex("Slider"), {
+            Text = options.Title,
+            Tooltip = options.Description or options.Desc,
+            Default = value.Default or value.Min or 0,
+            Min = value.Min or 0,
+            Max = value.Max or 100,
+            Rounding = sliderRounding(options.Step),
+            Callback = options.Callback,
+        })
+    end
+
+    function adapter:Dropdown(options)
+        local raw = ensureGroup():AddDropdown(options.Flag or nextControlIndex("Dropdown"), {
+            Text = options.Title,
+            Tooltip = options.Description or options.Desc,
+            Values = options.Values or {},
+            Default = options.Value,
+            Multi = false,
+            Searchable = true,
+            Callback = options.Callback,
+        })
+        return {
+            Refresh = function(_, values) raw:SetValues(values) end,
+            Select = function(_, value) raw:SetValue(value) end,
+        }
+    end
+
+    function adapter:Button(options)
+        return ensureGroup():AddButton({
+            Text = options.Title,
+            Tooltip = options.Description or options.Desc,
+            Func = options.Callback,
+        })
+    end
+
+    function adapter:Paragraph(options)
+        return ensureGroup():AddLabel((options.Title or "") .. "\n" .. (options.Desc or options.Description or ""), true)
+    end
+
+    return adapter
+end
+
+local Window = {
+    Tab = function(_, info) return createAdapterTab(info) end,
+    Tag = function() end,
+    SelectTab = function() end,
+    SetToggleKey = function(_, key)
+        local tab = ObsidianWindow:AddTab("UI Settings", "settings")
+        local group = tab:AddLeftGroupbox("Menu")
+        group:AddLabel("Menu Keybind"):AddKeyPicker("BagahMenuKeybind", {
+            Default = key.Name,
+            NoUI = true,
+            Text = "Menu Keybind",
+        })
+        Library.ToggleKeybind = Library.Options.BagahMenuKeybind
+    end,
+}
+
+local ObsidianUI = {
+    Notify = function(_, options)
+        Library:Notify({
+            Title = options.Title or "Bagah Hub",
+            Description = options.Content or options.Description or "",
+            Time = options.Duration or 2,
+        })
+    end,
+}
 
 Window:SetToggleKey(Enum.KeyCode.RightControl)
 
@@ -1140,7 +1310,7 @@ Window:SetToggleKey(Enum.KeyCode.RightControl)
 -- -------------------------------------------------------------------------- --
 
 local function Success(title, message, duration)
-    WindUI:Notify({
+    ObsidianUI:Notify({
         Title = title,
         Content = message,
         Duration = duration,
@@ -1149,7 +1319,7 @@ local function Success(title, message, duration)
 end
 
 local function Error(title, message, duration)
-    WindUI:Notify({
+    ObsidianUI:Notify({
         Title = title,
         Content = message,
         Duration = duration,
@@ -1158,7 +1328,7 @@ local function Error(title, message, duration)
 end
 
 local function Info(title, message, duration)
-    WindUI:Notify({
+    ObsidianUI:Notify({
         Title = title,
         Content = message,
         Duration = duration,
@@ -1167,7 +1337,7 @@ local function Info(title, message, duration)
 end
 
 local function Warning(title, message, duration)
-    WindUI:Notify({
+    ObsidianUI:Notify({
         Title = title,
         Content = message,
         Duration = duration,
@@ -1203,6 +1373,7 @@ local Rhythm    = {
     -- ── Timing mode settings ──────────────────────────────────────────
     Mode = "perfect",   -- "perfect" | "custom"
     PressLeadMs = 0,    -- extra ms to press early (default 0)
+    TwoLaneLeadMs = 12, -- 2-lane drum layout needs a small earlier input lead
     HoldExtendMs = 80,  -- extra ms to hold long notes (default 80)
     PerfectChance = 70, -- % chance of PERFECT in custom mode
     GoodChance = 25,    -- % chance of GOOD in custom mode
@@ -1357,6 +1528,12 @@ local function copyActiveDebugLogs()
     end
     if Rhythm.DebugEnabled then
         table.insert(reports, makeRhythmDebugReport())
+    end
+    if EspHealthDebug.Enabled then
+        table.insert(reports, getEspHealthDebugOutput())
+    end
+    if HudHealthDebug.Enabled then
+        table.insert(reports, getHudHealthDebugOutput())
     end
 
     if #reports == 0 then
@@ -2464,6 +2641,14 @@ local function rhythmGetCustomDelay()
     end
 end
 
+local function rhythmGetPressLead()
+    local leadMs = Rhythm.PressLeadMs or 0
+    if Rhythm.LaneCount == 2 then
+        leadMs += Rhythm.TwoLaneLeadMs or 0
+    end
+    return leadMs / 1000
+end
+
 local function rhythmCalibrateScrollSpeed(note, data, now, noteY)
     if data.lastY and data.lastAt then
         local dt = now - data.lastAt
@@ -2524,6 +2709,7 @@ local function rhythmStep()
     local songTimeVotes = Rhythm._songTimeVotes or {}
     Rhythm._songTimeVotes = songTimeVotes
     table.clear(songTimeVotes)
+    local pressLead = rhythmGetPressLead()
 
     for note, data in pairs(Rhythm.Active) do
         if not note.Parent then
@@ -2563,7 +2749,7 @@ local function rhythmStep()
                         table.insert(songTimeVotes, songTime)
                     end
 
-                    if timeToHit and timeToHit <= 0.005 and timeToHit >= -0.080
+                    if timeToHit and timeToHit <= 0.005 + pressLead and timeToHit >= -0.080
                         and now - (Rhythm.LastPress[data.lane] or 0) >= Rhythm.MinInterval then
                         data.pressed = true
                         Rhythm.LastPress[data.lane] = now
@@ -2574,7 +2760,8 @@ local function rhythmStep()
                         rhythmDebug("HIT", "lane=", data.lane, "noteTime=", string.format("%.4f", noteTime),
                             "timeToHit=", string.format("%.4f", timeToHit),
                             "scrollSpeed=", string.format("%.1f", Rhythm.ScrollSpeed),
-                            "hold=", scheduledHold ~= nil, "customDelay=", string.format("%.4f", customDelay))
+                            "lead=", string.format("%.4f", pressLead), "hold=", scheduledHold ~= nil,
+                            "customDelay=", string.format("%.4f", customDelay))
                         if customDelay <= 0 then
                             if scheduledHold then
                                 rhythmHoldUntilTail(note, receptor, data.lane, data.key,
@@ -2596,7 +2783,7 @@ local function rhythmStep()
                     end
                 elseif frameVelocity and frameVelocity > 1 then
                     local eta = (receptorY - noteY) / frameVelocity
-                    if eta <= 0.005 and eta >= -0.080
+                    if eta <= 0.005 + pressLead and eta >= -0.080
                         and now - (Rhythm.LastPress[data.lane] or 0) >= Rhythm.MinInterval then
                         data.pressed = true
                         Rhythm.LastPress[data.lane] = now
@@ -2605,7 +2792,8 @@ local function rhythmStep()
                         local generation = Rhythm.Generation
                         local customDelay = rhythmGetCustomDelay()
                         rhythmDebug("HIT", "lane=", data.lane, "eta=", string.format("%.4f", eta),
-                            "velocity=", string.format("%.2f", frameVelocity), "hold=", scheduledHold ~= nil,
+                            "velocity=", string.format("%.2f", frameVelocity),
+                            "lead=", string.format("%.4f", pressLead), "hold=", scheduledHold ~= nil,
                             "noteY=", string.format("%.1f", noteY), "targetY=", string.format("%.1f", receptorY),
                             "customDelay=", string.format("%.4f", customDelay))
                         if customDelay <= 0 then
@@ -2691,7 +2879,8 @@ local function setRhythmEnabled(value)
 end
 UserInputService.InputBegan:Connect(function(input, processed)
     if processed then return end
-    if input.KeyCode == Enum.KeyCode.F6 then
+    if input.KeyCode == Enum.KeyCode.F6
+        or (NO_UI_TEST_MODE and input.KeyCode == Enum.KeyCode.F3) then
         setRhythmEnabled(not Rhythm.Enabled)
     end
 end)
@@ -2907,10 +3096,8 @@ PlayerTab:Toggle({
     Callback = function(value)
         if value then
             startFly()
-            notify("Fly", "Enabled", 2)
         else
             stopFly()
-            notify("Fly", "Disabled", 2)
         end
     end
 })
@@ -2936,10 +3123,8 @@ PlayerTab:Toggle({
         Noclip.Enabled = value
         if value then
             enableNoclip()
-            notify("No Clip", "Enabled", 2)
         else
             disableNoclip()
-            notify("No Clip", "Disabled", 2)
         end
     end
 })
@@ -3043,7 +3228,7 @@ AutoParryTab:Section({ Title = "Auto Parry", TextSize = 20 })
 AutoParryTab:Toggle({
     Title = "Perfect Auto Parry",
     Description = "Ultra-fast automatic timing for regular and M2 parries; no setup required",
-    Default = false,
+    Default = true,
     Callback = function(Value)
         AutoParry.PerfectEnabled = Value
         AutoParry.ParryToken += 1
@@ -3052,7 +3237,6 @@ AutoParryTab:Toggle({
         refreshAnimationWatchers()
         if Value then
             debugLog("[BagahHub STATE]", "Perfect Auto Parry enabled")
-            notify("✨ Perfect Auto Parry", "ON - automatic M1/M2 timing", 2)
         else
             debugLog("[BagahHub STATE]", "Perfect Auto Parry disabled")
         end
@@ -3062,25 +3246,20 @@ AutoParryTab:Toggle({
 AutoParryTab:Toggle({
     Title = "Animation Sync",
     Description = "Optional high-precision timing from enemy animation progress; Perfect Auto Parry required",
-    Default = false,
+    Default = true,
     Callback = function(Value)
         AutoParry.AnimationSyncEnabled = Value
         AutoParry.ParryToken += 1
         AutoParry.PendingParry = {}
         releaseBlock()
         debugLog("[BagahHub STATE]", "Animation Sync", Value and "enabled" or "disabled")
-        if Value and not AutoParry.PerfectEnabled then
-            notify("🎯 Animation Sync", "Ready - enable Perfect Auto Parry to use it", 2)
-        elseif Value then
-            notify("🎯 Animation Sync", "ON - animation progress correction enabled", 2)
-        end
     end
 })
 
 AutoParryTab:Toggle({
     Title = "Parry Facing",
     Description = "Automatically face the attacker when parrying attacks from any direction",
-    Default = false,
+    Default = true,
     Callback = function(Value)
         AutoParry.FacingEnabled = Value
         if not Value then restoreParryFacing() end
@@ -3098,9 +3277,6 @@ AutoParryTab:Toggle({
         refreshAnimationWatchers()
         debugLog("[BagahHub STATE]", "Grapple-Aware Combat",
             Value and "enabled" or "disabled")
-        if Value then
-            notify("🥊 Grapple-Aware Combat", "ON - grapple/M2 backdash enabled", 2)
-        end
     end
 })
 
@@ -3123,7 +3299,6 @@ AutoParryTab:Toggle({
         AutoParry.FaceLockEnabled = Value
         if Value then
             startFaceLock()
-            notify("🎯 Face Lock", "ON - auto-facing nearest enemy", 2)
         else
             stopFaceLock()
         end
@@ -3294,13 +3469,44 @@ if DEBUG_TAB_ENABLED then
 
     DebugTab:Toggle({
         Title = "Runtime Profiler",
-        Description = "Capture simulation/render FPS, hitches, combat and animator callback counts every 2 seconds; use Copy Latest Runtime Profile to read it",
+        Description =
+        "Capture simulation/render FPS, hitches, combat and animator callback counts every 2 seconds; use Copy Latest Runtime Profile to read it",
         Default = false,
         Callback = function(value)
             if value then
                 startRuntimeProfiler()
             else
                 stopRuntimeProfiler()
+            end
+        end
+    })
+
+    DebugTab:Toggle({
+        Title = "ESP Health Debug",
+        Description = "Log ESP Humanoid cache, death, respawn, and health changes to the console",
+        Default = false,
+        Callback = function(value)
+            EspHealthDebug.Enabled = value
+            table.clear(EspHealthDebug.LastState)
+            if value then
+                table.clear(EspHealthDebug.Timeline)
+                table.insert(EspHealthDebug.Timeline,
+                    string.format("+%.6f | ESP health debug enabled; enable an ESP visual to begin tracking", os.clock()))
+            end
+        end
+    })
+
+    DebugTab:Toggle({
+        Title = "Player HUD Health Debug",
+        Description = "Log local Humanoid health and Player HUD updates across respawns",
+        Default = false,
+        Callback = function(value)
+            HudHealthDebug.Enabled = value
+            HudHealthDebug.LastState = nil
+            if value then
+                table.clear(HudHealthDebug.Timeline)
+                table.insert(HudHealthDebug.Timeline,
+                    string.format("+%.6f | Player HUD health debug enabled", os.clock()))
             end
         end
     })
@@ -3453,6 +3659,20 @@ local function espClearHighlights()
     end
 end
 
+local function espHealthDebug(model, state, humanoid)
+    if not EspHealthDebug.Enabled then return end
+    local health = humanoid and humanoid.Health or -1
+    local maxHealth = humanoid and humanoid.MaxHealth or -1
+    local message = string.format("%s | health=%.1f/%.1f | humanoid=%s",
+        state, health, maxHealth, tostring(humanoid))
+    if EspHealthDebug.LastState[model] == message then return end
+    EspHealthDebug.LastState[model] = message
+    local line = string.format("+%.6f | %s | %s", os.clock(), model.Name, message)
+    table.insert(EspHealthDebug.Timeline, line)
+    if #EspHealthDebug.Timeline > 500 then table.remove(EspHealthDebug.Timeline, 1) end
+    print("[BagahHub ESP HEALTH]", line)
+end
+
 local function espGetCharacter(model)
     if not model or not model:IsA("Model") then return nil end
     if model == LocalPlayer.Character then return nil end
@@ -3460,19 +3680,31 @@ local function espGetCharacter(model)
     -- Return cached refs if still valid (avoids FindFirstChild per frame)
     local cached = ESP.CharCache[model]
     if cached and cached.HRP.Parent == model and cached.Humanoid.Parent == model then
-        if cached.Humanoid.Health <= 0 then return nil end
-        return cached
+        if cached.Humanoid.Health > 0 then
+            espHealthDebug(model, "cached", cached.Humanoid)
+            return cached
+        end
+        espHealthDebug(model, "cached dead; clearing", cached.Humanoid)
+        ESP.CharCache[model] = nil
     end
 
-    local hrp = model:FindFirstChild("HumanoidRootPart")
-    local hum = model:FindFirstChildOfClass("Humanoid")
-    if not hrp or not hum or hum.Health <= 0 then
+    local hum = nil
+    for _, child in ipairs(model:GetChildren()) do
+        if child:IsA("Humanoid") and child.Health > 0 then
+            hum = child
+            break
+        end
+    end
+    local hrp = hum and hum.RootPart or model:FindFirstChild("HumanoidRootPart")
+    if not hrp or not hum then
+        espHealthDebug(model, "no live humanoid", hum)
         ESP.CharCache[model] = nil
         return nil
     end
 
     local data = { Model = model, HRP = hrp, Humanoid = hum, Head = model:FindFirstChild("Head"), Name = model.Name }
     ESP.CharCache[model] = data
+    espHealthDebug(model, "resolved live humanoid", hum)
     return data
 end
 
@@ -3506,6 +3738,7 @@ local function espClearModel(model)
         end)
         ESP.Highlights[model] = nil
     end
+    EspHealthDebug.LastState[model] = nil
 end
 
 local function espHideModel(model)
@@ -3900,12 +4133,26 @@ local function hudRemoveBar(bar)
     end)
 end
 
+local function hudHealthDebug(state, humanoid)
+    if not HudHealthDebug.Enabled then return end
+    local message = string.format("%s | health=%.1f/%.1f | humanoid=%s",
+        state, humanoid and humanoid.Health or -1, humanoid and humanoid.MaxHealth or -1,
+        tostring(humanoid))
+    if HudHealthDebug.LastState == message then return end
+    HudHealthDebug.LastState = message
+    local line = string.format("+%.6f | %s", os.clock(), message)
+    table.insert(HudHealthDebug.Timeline, line)
+    if #HudHealthDebug.Timeline > 300 then table.remove(HudHealthDebug.Timeline, 1) end
+    print("[BagahHub HUD HEALTH]", line)
+end
+
 local function hudUpdateHealth()
     if not (HUD.ShowHealth and HUD.Objects.health) then return end
     local char = LocalPlayer.Character
     if not char then return end
     local hum = char:FindFirstChildOfClass("Humanoid")
     if not hum then return end
+    hudHealthDebug("render", hum)
     local hpPercent = math.floor((hum.Health / hum.MaxHealth) * 100)
     local color = hpPercent > 50 and Color3.fromRGB(80, 255, 80)
         or hpPercent > 25 and Color3.fromRGB(255, 200, 0)
@@ -3935,6 +4182,7 @@ local function startHud()
         if char then
             local hum = char:FindFirstChildOfClass("Humanoid")
             if hum then
+                hudHealthDebug("connected", hum)
                 hudUpdateHealth()
                 table.insert(HUD.Connections, hum:GetPropertyChangedSignal("Health"):Connect(hudUpdateHealth))
                 table.insert(HUD.Connections, hum:GetPropertyChangedSignal("MaxHealth"):Connect(hudUpdateHealth))
@@ -3959,6 +4207,16 @@ local function stopHud()
         HUD.Objects = {}
     end
 end
+
+LocalPlayer.CharacterAdded:Connect(function(character)
+    if not HUD.ShowHealth and not HUD.ShowStamina then return end
+    task.spawn(function()
+        local humanoid = character:WaitForChild("Humanoid", 5)
+        if humanoid and character == LocalPlayer.Character then
+            startHud()
+        end
+    end)
+end)
 
 VisualTab:Toggle({
     Title = "Show Health",
@@ -4011,7 +4269,7 @@ local function stopAntiAfk()
     end
 end
 
-local MiscTab = Window:Tab({ Title = "Misc", Icon = "gravity:bulb" })
+local MiscTab = Window:Tab({ Title = "Misc", Icon = "music" })
 
 MiscTab:Section({ Title = "Music Game Rhythm", TextSize = 20 })
 
@@ -4037,7 +4295,7 @@ MiscTab:Dropdown({
 
 MiscTab:Slider({
     Title = "Press Lead (ms)",
-    Description = "Extra milliseconds to press early (0 = exact timing)",
+    Description = "Extra early input; 2-note mode automatically adds 12ms",
     Flag = "RhythmPressLead",
     Value = { Min = 0, Max = 100, Default = 0 },
     Step = 5,
@@ -4093,7 +4351,7 @@ MiscTab:Slider({
 MiscTab:Toggle({
     Title = "Anti AFK",
     Description = "Prevent auto-kick by simulating input when idle",
-    Default = false,
+    Default = true,
     Callback = function(value)
         AntiAfk.Enabled = value
         if value then
@@ -4112,6 +4370,42 @@ MiscTab:Toggle({
 local function getServerLink()
     return string.format("https://www.roblox.com/games/start?placeId=%d&jobId=%s", game.PlaceId, game.JobId)
 end
+
+local GAKURAN_LOADER_URL = "https://api.jnkie.com/api/v1/luascripts/public/6822e52f14d974d7ab5e785174576c7ebc8dff5ed50af79df6fbda0bd4c53f49/download"
+local AutoExecuteOnTeleport = true
+local teleportQueueAttempted = false
+local teleportQueueSucceeded = false
+
+local function queueGakuranReload()
+    if teleportQueueAttempted then return teleportQueueSucceeded end
+    teleportQueueAttempted = true
+
+    local env = getfenv and getfenv() or _G
+    local synApi = rawget(env, "syn")
+    local fluxusApi = rawget(env, "fluxus")
+    local queue = rawget(env, "queue_on_teleport")
+        or (typeof(synApi) == "table" and synApi.queue_on_teleport)
+        or (typeof(fluxusApi) == "table" and fluxusApi.queue_on_teleport)
+    if typeof(queue) ~= "function" then
+        Warning("Auto Execute Unavailable", "Your executor does not support queue_on_teleport", 3)
+        return false
+    end
+
+    local loader = string.format("loadstring(game:HttpGet(%q))()", GAKURAN_LOADER_URL)
+    local success, err = pcall(queue, loader)
+    if not success then
+        Warning("Auto Execute Failed", tostring(err), 3)
+        return false
+    end
+    teleportQueueSucceeded = true
+    return true
+end
+
+LocalPlayer.OnTeleport:Connect(function(state)
+    if AutoExecuteOnTeleport and state == Enum.TeleportState.Started then
+        queueGakuranReload()
+    end
+end)
 
 local ServerTab = Window:Tab({ Icon = "server", Title = "Server" })
 
@@ -4157,6 +4451,7 @@ ServerTab:Button({
     Desc = "Rejoin the current server",
     Icon = "refresh-cw",
     Callback = function()
+        queueGakuranReload()
         game:GetService("TeleportService"):Teleport(game.PlaceId, LocalPlayer)
     end
 })
@@ -4180,10 +4475,10 @@ ServerTab:Button({
                 local randomServer = filteredServers[math.random(1, #filteredServers)]
                 game:GetService("TeleportService"):TeleportToPlaceInstance(game.PlaceId, randomServer.id, LocalPlayer)
             else
-                WindUI:Notify({ Title = "Server Hop Failed", Content = "No servers with 5+ players found!", Duration = 3 })
+                ObsidianUI:Notify({ Title = "Server Hop Failed", Content = "No servers with 5+ players found!", Duration = 3 })
             end
         else
-            WindUI:Notify({ Title = "Server Hop Failed", Content = "Could not fetch servers!", Duration = 3 })
+            ObsidianUI:Notify({ Title = "Server Hop Failed", Content = "Could not fetch servers!", Duration = 3 })
         end
     end
 })
@@ -4203,7 +4498,7 @@ ServerTab:Button({
                 game:GetService("TeleportService"):TeleportToPlaceInstance(game.PlaceId, servers.data[1].id, LocalPlayer)
             end
         else
-            WindUI:Notify({ Title = "Server Hop Failed", Content = "Could not fetch servers!", Duration = 3 })
+            ObsidianUI:Notify({ Title = "Server Hop Failed", Content = "Could not fetch servers!", Duration = 3 })
         end
     end
 
@@ -4236,6 +4531,70 @@ InfoTab:Paragraph({
     Desc = "ahmuq"
 })
 
+AntiAfk.Enabled = true
+startAntiAfk()
+
+local function unloadBagah()
+    AutoExecuteOnTeleport = false
+    AutoParry.PerfectEnabled = false
+    AutoParry.AnimationSyncEnabled = false
+    AutoParry.GrappleAwareEnabled = false
+    AutoParry.AutoPunishEnabled = false
+    AutoParry.FacingEnabled = false
+    AutoParry.FaceLockEnabled = false
+    AutoParry.BlockM1Enabled = false
+    AutoParry.BlockM1Active = false
+    AutoParry.ComboHoldEnabled = false
+    AutoParry.FacingCheckEnabled = false
+    AutoParry.FallbackBlockEnabled = false
+    AutoParry.ParryToken += 1
+    table.clear(AutoParry.PendingParry)
+    releaseBlock()
+    stopFaceLock()
+    refreshAnimationWatchers()
+
+    setRhythmEnabled(false)
+    stopFly()
+    Noclip.Enabled = false
+    disableNoclip()
+    HUD.ShowHealth = false
+    HUD.ShowStamina = false
+    stopHud()
+    stopAntiAfk()
+    stopRuntimeProfiler()
+    ESP.ShowBox = false
+    ESP.ShowHealth = false
+    ESP.ShowStamina = false
+    ESP.ShowTracer = false
+    ESP.ShowInfo = false
+    ESP.ShowHighlight = false
+    local espModels = {}
+    for model in pairs(ESP.Objects) do table.insert(espModels, model) end
+    for _, model in ipairs(espModels) do espClearModel(model) end
+    espClearHighlights()
+    setInfiniteStamina(false)
+    setNoDodgeCooldown(false)
+    setAntiStun(false)
+    setAntiRagdoll(false)
+    Dbg.Events = false
+    Dbg.StunEvents = false
+    disconnectStunDebugConnections()
+    Library:Unload()
+end
+
+local ConfigTab = ObsidianWindow:AddTab("Configs", "folder-cog")
+SaveManager:SetLibrary(Library)
+SaveManager:IgnoreThemeSettings()
+SaveManager:SetFolder("BagahHubGakuran")
+SaveManager:SetSubFolder("Gakuran-" .. tostring(game.PlaceId))
+SaveManager:BuildConfigSection(ConfigTab)
+SaveManager:LoadAutoloadConfig()
+ConfigTab:AddRightGroupbox("Script"):AddButton({
+    Text = "Unload Bagah",
+    Tooltip = "Disable all Bagah features and close the UI",
+    Func = unloadBagah,
+})
+
 
 Window:SelectTab(1)
 
@@ -4261,7 +4620,7 @@ end)
 --                            NOTIFICATION HELPER                             --
 -- ========================================================================= --
 notify = function(title, text, duration)
-    WindUI:Notify({
+    ObsidianUI:Notify({
         Title = title,
         Content = text,
         Duration = duration or 2,
