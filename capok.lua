@@ -192,11 +192,96 @@ local Dbg = {
     StunEvents = false,
     StunTimeline = {},
     StunStartedAt = os.clock(),
-    ArDebug = false,
-    ArTimeline = {},
 }
 
+local RuntimeProfiler = {
+    Enabled = false,
+    Conn = nil,
+    RenderConn = nil,
+    Interval = 2,
+    LastReportAt = 0,
+    LastReport = "No runtime profile captured yet.",
+}
+
+local function resetRuntimeProfileCounters()
+    RuntimeProfiler.Frames = 0
+    RuntimeProfiler.FrameTime = 0
+    RuntimeProfiler.MaxFrameTime = 0
+    RuntimeProfiler.Hitches = 0
+    RuntimeProfiler.RenderFrames = 0
+    RuntimeProfiler.RenderFrameTime = 0
+    RuntimeProfiler.RenderMaxFrameTime = 0
+    RuntimeProfiler.RenderHitches = 0
+    RuntimeProfiler.CombatEvents = 0
+    RuntimeProfiler.WatchedAnimations = 0
+    RuntimeProfiler.AnimationEvents = 0
+    RuntimeProfiler.RelevantAnimations = 0
+    RuntimeProfiler.FaceLockTicks = 0
+    RuntimeProfiler.EspFrames = 0
+    RuntimeProfiler.EspTime = 0
+    RuntimeProfiler.RhythmFrames = 0
+    RuntimeProfiler.RhythmTime = 0
+    RuntimeProfiler.Namecalls = 0
+end
+
+local function stopRuntimeProfiler()
+    RuntimeProfiler.Enabled = false
+    if RuntimeProfiler.Conn then
+        RuntimeProfiler.Conn:Disconnect()
+        RuntimeProfiler.Conn = nil
+    end
+    if RuntimeProfiler.RenderConn then
+        RuntimeProfiler.RenderConn:Disconnect()
+        RuntimeProfiler.RenderConn = nil
+    end
+end
+
+local function startRuntimeProfiler()
+    if RuntimeProfiler.Conn then
+        RuntimeProfiler.Enabled = true
+        return
+    end
+    RuntimeProfiler.Enabled = true
+    RuntimeProfiler.LastReportAt = os.clock()
+    resetRuntimeProfileCounters()
+    RuntimeProfiler.RenderConn = RunService.RenderStepped:Connect(function(dt)
+        if not RuntimeProfiler.Enabled then return end
+        RuntimeProfiler.RenderFrames += 1
+        RuntimeProfiler.RenderFrameTime += dt
+        RuntimeProfiler.RenderMaxFrameTime = math.max(RuntimeProfiler.RenderMaxFrameTime, dt)
+        if dt >= 0.05 then RuntimeProfiler.RenderHitches += 1 end
+    end)
+    RuntimeProfiler.Conn = RunService.Heartbeat:Connect(function(dt)
+        if not RuntimeProfiler.Enabled then return end
+        RuntimeProfiler.Frames += 1
+        RuntimeProfiler.FrameTime += dt
+        RuntimeProfiler.MaxFrameTime = math.max(RuntimeProfiler.MaxFrameTime, dt)
+        if dt >= 0.05 then RuntimeProfiler.Hitches += 1 end
+
+        local now = os.clock()
+        local elapsed = now - RuntimeProfiler.LastReportAt
+        if elapsed < RuntimeProfiler.Interval then return end
+
+        local fps = RuntimeProfiler.FrameTime > 0
+            and RuntimeProfiler.Frames / RuntimeProfiler.FrameTime or 0
+        local renderFps = RuntimeProfiler.RenderFrameTime > 0
+            and RuntimeProfiler.RenderFrames / RuntimeProfiler.RenderFrameTime or 0
+        RuntimeProfiler.LastReport = string.format(
+            "[BagahHub PROFILE] %.1fs | sim %.1fFPS %.1fms/%d | render %.1fFPS %.1fms/%d | combat %d | anim %d/%d/%d | face %d | ESP %d %.2fms | rhythm %d %.2fms | namecalls %d",
+            elapsed, fps, RuntimeProfiler.MaxFrameTime * 1000, RuntimeProfiler.Hitches,
+            renderFps, RuntimeProfiler.RenderMaxFrameTime * 1000, RuntimeProfiler.RenderHitches,
+            RuntimeProfiler.CombatEvents, RuntimeProfiler.RelevantAnimations,
+            RuntimeProfiler.AnimationEvents, RuntimeProfiler.WatchedAnimations, RuntimeProfiler.FaceLockTicks,
+            RuntimeProfiler.EspFrames, RuntimeProfiler.EspTime * 1000,
+            RuntimeProfiler.RhythmFrames, RuntimeProfiler.RhythmTime * 1000,
+            RuntimeProfiler.Namecalls)
+        RuntimeProfiler.LastReportAt = now
+        resetRuntimeProfileCounters()
+    end)
+end
+
 local function debugLog(...)
+    if not Dbg.Events then return end
     local values = { ... }
     for index, value in values do
         values[index] = tostring(value)
@@ -326,13 +411,31 @@ local function releaseBlock(expectedToken)
     debugLog("[BagahHub BLOCK]", "RELEASED", "serverTime:", workspace:GetServerTimeNow())
 end
 
+local CombatModelCache = {}
+local CombatRootCache = {}
+
 local function getCombatModel(modelName)
+    local cached = CombatModelCache[modelName]
+    if cached and cached.Parent then return cached end
+
     local workspacePlayers = workspace:FindFirstChild("Players")
     local workspaceNpcs = workspace:FindFirstChild("NPCs")
     local model = workspacePlayers and workspacePlayers:FindFirstChild(modelName)
         or workspaceNpcs and workspaceNpcs:FindFirstChild(modelName)
     local player = Players:FindFirstChild(modelName)
-    return model or player and player.Character
+    model = model or player and player.Character
+    if model then CombatModelCache[modelName] = model end
+    return model
+end
+
+local function getCombatRoot(model)
+    if not model then return nil end
+    local cached = CombatRootCache[model]
+    if cached and cached.Parent == model then return cached end
+
+    local root = model:FindFirstChild("HumanoidRootPart")
+    CombatRootCache[model] = root
+    return root
 end
 
 local function faceAttacker(attackerName)
@@ -340,8 +443,8 @@ local function faceAttacker(attackerName)
 
     local localModel = LocalPlayer.Character or getCombatModel(LocalPlayer.Name)
     local attackerModel = getCombatModel(attackerName)
-    local localRoot = localModel and localModel:FindFirstChild("HumanoidRootPart")
-    local attackerRoot = attackerModel and attackerModel:FindFirstChild("HumanoidRootPart")
+    local localRoot = getCombatRoot(localModel)
+    local attackerRoot = getCombatRoot(attackerModel)
     local humanoid = localModel and localModel:FindFirstChildOfClass("Humanoid")
     if not localRoot or not attackerRoot or not humanoid then return end
 
@@ -363,12 +466,12 @@ local function faceAttacker(attackerName)
     debugLog("[BagahHub FACING]", "turned toward", attackerName)
 end
 
-local function getAttackerDistance(attackerName)
-    local attackerModel = getCombatModel(attackerName)
+local function getAttackerDistance(attackerName, attackerModel)
+    attackerModel = attackerModel or getCombatModel(attackerName)
 
     local localModel = LocalPlayer.Character or getCombatModel(LocalPlayer.Name)
-    local localRoot = localModel and localModel:FindFirstChild("HumanoidRootPart")
-    local attackerRoot = attackerModel and attackerModel:FindFirstChild("HumanoidRootPart")
+    local localRoot = getCombatRoot(localModel)
+    local attackerRoot = getCombatRoot(attackerModel)
     if not localRoot or not attackerRoot then return math.huge end
     return (localRoot.Position - attackerRoot.Position).Magnitude
 end
@@ -376,9 +479,9 @@ end
 -- ── Facing Check: only parry attackers actually facing you ───────────── --
 local function isAttackerFacingMe(attackerName, maxAngle)
     local attackerModel = getCombatModel(attackerName)
-    local attackerRoot = attackerModel and attackerModel:FindFirstChild("HumanoidRootPart")
+    local attackerRoot = getCombatRoot(attackerModel)
     local localModel = LocalPlayer.Character or getCombatModel(LocalPlayer.Name)
-    local localRoot = localModel and localModel:FindFirstChild("HumanoidRootPart")
+    local localRoot = getCombatRoot(localModel)
     if not attackerRoot or not localRoot then return true end -- can't tell, allow parry
     local toMe = (localRoot.Position - attackerRoot.Position)
     if toMe.Magnitude < 0.01 then return true end
@@ -406,29 +509,39 @@ local function startFaceLock()
             stopFaceLock()
             return
         end
+        if RuntimeProfiler.Enabled then RuntimeProfiler.FaceLockTicks += 1 end
         local char = LocalPlayer.Character
         if not char then return end
-        local root = char:FindFirstChild("HumanoidRootPart")
+        local root = getCombatRoot(char)
         local humanoid = char:FindFirstChildOfClass("Humanoid")
         if not root or not humanoid then return end
 
-        -- Find nearest enemy within FaceTargetRange
+        local inCombat = char:GetAttribute("Blocking") == true
+            or char:GetAttribute("CombatAttacking") == true
+            or AutoParry.IsBlocking
+        if not inCombat then
+            if AutoParry.FacingHumanoid == humanoid then
+                restoreParryFacing()
+            end
+            return
+        end
+
         local nearest, nearestDist = nil, AutoParry.FaceTargetRange
-        local containers = { workspace:FindFirstChild("Players"), workspace:FindFirstChild("NPCs") }
-        for _, container in containers do
-            if container then
-                for _, model in container:GetChildren() do
-                    if model:IsA("Model") and model ~= char and model.Name ~= LocalPlayer.Name then
-                        local hrp = model:FindFirstChild("HumanoidRootPart")
-                        local hum = model:FindFirstChildOfClass("Humanoid")
-                        if hrp and hum and hum.Health > 0 then
-                            local d = (hrp.Position - root.Position).Magnitude
-                            if d < nearestDist then
-                                nearest, nearestDist = hrp, d
-                            end
+        local now = os.clock()
+        for attackerName, swingTime in pairs(AutoParry.LastSwing) do
+            if now - swingTime < 3 then
+                local model = getCombatModel(attackerName)
+                if model then
+                    local hrp = getCombatRoot(model)
+                    if hrp then
+                        local d = (hrp.Position - root.Position).Magnitude
+                        if d < nearestDist then
+                            nearest, nearestDist = hrp, d
                         end
                     end
                 end
+            else
+                AutoParry.LastSwing[attackerName] = nil
             end
         end
 
@@ -443,6 +556,8 @@ local function startFaceLock()
             if (target - root.Position).Magnitude > 0.01 then
                 root.CFrame = CFrame.lookAt(root.Position, target)
             end
+        elseif AutoParry.FacingHumanoid == humanoid then
+            restoreParryFacing()
         end
     end)
 end
@@ -506,7 +621,7 @@ end
 -- When a real parry can't be scheduled (out of range, facing-check fail,
 -- cooldown, etc.) but an attack is incoming, hold block briefly so the
 -- character still mitigates damage instead of eating it raw.
-local function fallbackBlock(attackerName)
+local function fallbackBlock(attackerName, distance, attackerModel)
     if not AutoParry.FallbackBlockEnabled then return end
     if not isAnyAutoParryEnabled() then return end
     -- Don't override an active parry/block window
@@ -514,7 +629,8 @@ local function fallbackBlock(attackerName)
     local now = os.clock()
     if now - AutoParry.LastFallbackBlock < 0.35 then return end
     -- Only bother if the attacker is within fallback range
-    if getAttackerDistance(attackerName) > AutoParry.FallbackBlockRange then return end
+    distance = distance or getAttackerDistance(attackerName, attackerModel)
+    if distance > AutoParry.FallbackBlockRange then return end
 
     AutoParry.LastFallbackBlock = now
     faceAttacker(attackerName)
@@ -533,7 +649,7 @@ local notify
 -- ========================================================================= --
 --                       PRE-HIT ANIMATION DETECTION                         --
 -- ========================================================================= --
-local AnimReg = { Conns = {}, ModelConns = {}, Attack = {}, Grapple = {} }
+local AnimReg = { Conns = {}, ModelConns = {}, WatchTokens = {}, Attack = {}, Grapple = {} }
 
 local function normalizeAnimationId(animationId)
     return tostring(animationId or ""):match("%d+") or ""
@@ -556,9 +672,6 @@ local function registerGrappleAnimation(animation)
 end
 
 local function autoBackdash(attackerName, animationPath)
-    local now = os.clock()
-    if now - AutoParry.LastGrappleDodge < 0.75 then return end
-    AutoParry.LastGrappleDodge = now
     VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.S, false, game)
     task.wait()
     VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.Q, false, game)
@@ -676,11 +789,16 @@ end
 buildAttackAnimationRegistry()
 
 local function disconnectAnimator(model)
+    AnimReg.WatchTokens[model] = nil
     local connection = AnimReg.Conns[model]
     if connection then
         connection:Disconnect()
         AnimReg.Conns[model] = nil
     end
+    if CombatModelCache[model.Name] == model then
+        CombatModelCache[model.Name] = nil
+    end
+    CombatRootCache[model] = nil
 end
 
 local function watchCharacter(character)
@@ -689,28 +807,37 @@ local function watchCharacter(character)
         return
     end
     disconnectAnimator(character)
+    CombatModelCache[character.Name] = character
+    if not isAnyAutoParryEnabled() and not AutoParry.GrappleAwareEnabled then return end
+    local watchToken = {}
+    AnimReg.WatchTokens[character] = watchToken
 
     task.spawn(function()
         local humanoid = character:FindFirstChildOfClass("Humanoid")
             or character:WaitForChild("Humanoid", 10)
         local animator = humanoid and (humanoid:FindFirstChildOfClass("Animator")
             or humanoid:WaitForChild("Animator", 10))
-        if not animator or not character.Parent then return end
+        if not animator or not character.Parent or AnimReg.WatchTokens[character] ~= watchToken then return end
 
         AnimReg.Conns[character] = animator.AnimationPlayed:Connect(function(track)
+            if RuntimeProfiler.Enabled then RuntimeProfiler.WatchedAnimations += 1 end
             if not isAnyAutoParryEnabled() and not AutoParry.GrappleAwareEnabled then return end
-            if character:GetAttribute("CanFight") == false or character:GetAttribute("Ragdoll") == true then return end
-            local maxDistance = AutoParry.PerfectEnabled
-                and PERFECT_PARRY_CONFIG.MaxDistance or AutoParry.MaxDistance
-            if getAttackerDistance(character.Name) > maxDistance then
-                fallbackBlock(character.Name)
-                return
-            end
-
+            if RuntimeProfiler.Enabled then RuntimeProfiler.AnimationEvents += 1 end
             local animationId = normalizeAnimationId(track.Animation and track.Animation.AnimationId)
             if animationId == "" then return end
             local registryPath = AnimReg.Attack[animationId]
             local grapplePath = AnimReg.Grapple[animationId]
+            if not registryPath and not grapplePath then return end
+            if RuntimeProfiler.Enabled then RuntimeProfiler.RelevantAnimations += 1 end
+
+            local maxDistance = AutoParry.PerfectEnabled
+                and PERFECT_PARRY_CONFIG.MaxDistance or AutoParry.MaxDistance
+            local distance = getAttackerDistance(character.Name, character)
+            if distance > maxDistance then
+                fallbackBlock(character.Name, distance, character)
+                return
+            end
+            if character:GetAttribute("CanFight") == false or character:GetAttribute("Ragdoll") == true then return end
 
             if Dbg.Events then
                 debugLog("[BagahHub ANIMATION]", character.Name, "| name:", track.Name,
@@ -720,7 +847,11 @@ local function watchCharacter(character)
 
             if AutoParry.GrappleAwareEnabled and grapplePath then
                 AutoParry.PendingParry[character.Name] = nil
-                task.spawn(autoBackdash, character.Name, grapplePath)
+                local now = os.clock()
+                if now - AutoParry.LastGrappleDodge >= 0.75 then
+                    AutoParry.LastGrappleDodge = now
+                    task.spawn(autoBackdash, character.Name, grapplePath)
+                end
                 return
             end
 
@@ -792,8 +923,23 @@ local function watchContainer(container)
     container.ChildRemoved:Connect(disconnectAnimator)
 end
 
+local function refreshAnimationWatchers()
+    if isAnyAutoParryEnabled() or AutoParry.GrappleAwareEnabled then
+        local container = workspace:FindFirstChild("Players")
+        if container then
+            for _, character in container:GetChildren() do
+                watchCharacter(character)
+            end
+        end
+        return
+    end
+
+    local models = {}
+    for model in pairs(AnimReg.Conns) do table.insert(models, model) end
+    for _, model in ipairs(models) do disconnectAnimator(model) end
+end
+
 watchContainer(workspace:WaitForChild("Players", 10))
-watchContainer(workspace:WaitForChild("NPCs", 10))
 
 for _, player in Players:GetPlayers() do
     if player ~= LocalPlayer and player.Character then watchCharacter(player.Character) end
@@ -806,67 +952,55 @@ end)
 --                          INCOMING ATTACK DETECTION                         --
 -- ========================================================================= --
 
-CombatClientRemote.OnClientEvent:Connect(function(...)
-    local args      = { ... }
-    local eventType = args[1]
-
-    if Dbg.Events then
-        local argStr = ""
-        for i = 1, math.min(#args, 6) do
-            argStr = argStr .. tostring(args[i]) .. " | "
-        end
-        debugLog("[BagahHub EVENT]", eventType, "| Args:", argStr)
-    end
-
+CombatClientRemote.OnClientEvent:Connect(function(eventType, ...)
+    if RuntimeProfiler.Enabled then RuntimeProfiler.CombatEvents += 1 end
     if not isAnyAutoParryEnabled() then return end
 
-
     if eventType == "NpcCombatSound" then
-        local attacker = args[2]
-        local action   = args[3]
-
+        local attacker, action = ...
 
         if action == "PunchSwing" and attacker ~= LocalPlayer.Name then
-            local distance = getAttackerDistance(attacker)
+            local attackerModel = getCombatModel(attacker)
+            local distance = getAttackerDistance(attacker, attackerModel)
             local maxDistance = AutoParry.PerfectEnabled
                 and PERFECT_PARRY_CONFIG.MaxDistance or AutoParry.MaxDistance
-            if distance <= maxDistance then
-                local now = os.clock()
-                local candidates = AutoParry.RecentAttackAnimations[attacker]
-                local recent
+            if distance > maxDistance then
+                fallbackBlock(attacker, distance, attackerModel)
+                return
+            end
 
-                if candidates then
-                    for index = #candidates, 1, -1 do
-                        local candidate = candidates[index]
-                        local age = now - candidate.StartedAt
-                        if age > 2 then
-                            table.remove(candidates, index)
-                        elseif not recent and age >= 0.05 then
-                            recent = candidate
-                        end
+            if Dbg.Events then
+                debugLog("[BagahHub EVENT]", eventType, "| attacker:", attacker, "| action:", action, "| dist:", distance)
+            end
+
+            local now = os.clock()
+            local candidates = AutoParry.RecentAttackAnimations[attacker]
+            local recent
+
+            if candidates then
+                for index = #candidates, 1, -1 do
+                    local candidate = candidates[index]
+                    local age = now - candidate.StartedAt
+                    if age > 2 then
+                        table.remove(candidates, index)
+                    elseif not recent and age >= 0.05 then
+                        recent = candidate
                     end
                 end
+            end
 
-                if recent then
-                    local impactTime = now - recent.StartedAt
-                    if impactTime > 0.05 and impactTime < 2 then
-                        local previousImpact = AutoParry.LearnedImpactTime[recent.Id]
-                        local learnedImpact = previousImpact
-                            and (previousImpact * 0.75 + impactTime * 0.25)
-                            or impactTime
-                        AutoParry.LearnedImpactTime[recent.Id] = learnedImpact
-                        local learnedDelay = math.max(AutoParry.MinParryDelay,
-                            learnedImpact - AutoParry.ImpactLead)
-                        if Dbg.Events then
-                            debugLog("[BagahHub LEARNED]", recent.Id, "| sample:", impactTime,
-                                "| smoothed impact:", learnedImpact, "| next delay:", learnedDelay)
-                        end
+            if recent then
+                local impactTime = now - recent.StartedAt
+                if impactTime > 0.05 and impactTime < 2 then
+                    local previousImpact = AutoParry.LearnedImpactTime[recent.Id]
+                    local learnedImpact = previousImpact
+                        and (previousImpact * 0.75 + impactTime * 0.25)
+                        or impactTime
+                    AutoParry.LearnedImpactTime[recent.Id] = learnedImpact
+                    if Dbg.Events then
+                        debugLog("[BagahHub LEARNED]", recent.Id, "| sample:", impactTime,
+                            "| smoothed impact:", learnedImpact)
                     end
-                elseif Dbg.Events then
-                    debugLog("[BagahHub LEARN]", "no registered attack-animation candidate for", attacker)
-                end
-                if Dbg.Events then
-                    debugLog("[BagahHub IMPACT]", attacker, "| distance:", distance)
                 end
             end
         end
@@ -874,7 +1008,8 @@ CombatClientRemote.OnClientEvent:Connect(function(...)
 
         if action == "PerfectBlocked" and attacker == LocalPlayer.Name then
             local now = os.clock()
-            if now - AutoParry.LastPerfectResult >= 0.15 then
+            local isNewResult = now - AutoParry.LastPerfectResult >= 0.15
+            if isNewResult then
                 AutoParry.TotalPerfectBlocks += 1
                 AutoParry.LastPerfectResult = now
             end
@@ -890,7 +1025,7 @@ CombatClientRemote.OnClientEvent:Connect(function(...)
             if Dbg.Events then
                 debugLog("[BagahHub RESULT]", "PERFECT PARRY (Sound)")
             end
-            if AutoParry.Notification then
+            if isNewResult and AutoParry.Notification then
                 notify("✨ Perfect Parry!", "Perfect block!", 1.5)
             end
         end
@@ -918,14 +1053,13 @@ CombatClientRemote.OnClientEvent:Connect(function(...)
 
 
     if eventType == "CombatPairCosmetic" then
-        local action   = args[2]
-        local attacker = args[3]
-        local victim   = args[4]
+        local action, attacker, victim = ...
 
         if (action == "M1PerfectBlocked" or action == "M2PerfectBlocked")
             and victim == LocalPlayer.Name then
             local now = os.clock()
-            if now - AutoParry.LastPerfectResult >= 0.15 then
+            local isNewResult = now - AutoParry.LastPerfectResult >= 0.15
+            if isNewResult then
                 AutoParry.TotalPerfectBlocks += 1
                 AutoParry.LastPerfectResult = now
             end
@@ -934,7 +1068,7 @@ CombatClientRemote.OnClientEvent:Connect(function(...)
                 debugLog("[BagahHub RESULT]", "PERFECT PARRY | attacker:", attacker,
                     "| victim:", victim)
             end
-            if AutoParry.Notification then
+            if isNewResult and AutoParry.Notification then
                 notify("✨ Perfect Parry!", "Blocked " .. tostring(victim), 1.5)
             end
         end
@@ -1091,6 +1225,7 @@ local Rhythm    = {
     RatingSpy = false,
     RatingConn = nil,
     RatingRemoveConn = nil,
+    RatingTextConns = {},
     RatingCounts = {},
     RatingTotal = 0,
     LastPressAt = {},
@@ -1222,15 +1357,6 @@ local function copyActiveDebugLogs()
     end
     if Rhythm.DebugEnabled then
         table.insert(reports, makeRhythmDebugReport())
-    end
-    if Dbg.ArDebug then
-        local report = "=== Auto Respawn Debug ===\n"
-        if #Dbg.ArTimeline > 0 then
-            report = report .. table.concat(Dbg.ArTimeline, "\n")
-        else
-            report = report .. "(no knock events yet)"
-        end
-        table.insert(reports, report)
     end
 
     if #reports == 0 then
@@ -1526,6 +1652,20 @@ local function hookNamecall()
 
     local success, result = pcall(function()
         CS.OldNamecall = hookmetamethod(game, "__namecall", function(self, ...)
+            if RuntimeProfiler.Enabled then RuntimeProfiler.Namecalls += 1 end
+            if not CS.InfiniteStamina and not CS.NoDodgeCooldown
+                and not CS.AntiStun and not CS.AntiRagdoll
+                and not AutoParry.BlockM1Active and not Dbg.StunEvents then
+                return CS.OldNamecall(self, ...)
+            end
+
+            -- These features only target the local character or combat remotes.
+            -- Avoid resolving the method for unrelated game namecalls.
+            if not Dbg.StunEvents and self ~= cachedCharacter
+                and self ~= RemotesServer and self ~= SprintRemote then
+                return CS.OldNamecall(self, ...)
+            end
+
             local method = getnamecallmethod()
 
             if Dbg.StunEvents and (method == "FireServer" or method == "InvokeServer") then
@@ -1662,10 +1802,6 @@ end
 
 LocalPlayer.CharacterAdded:Connect(function(character)
     cachedCharacter = character
-    if CS.InfiniteStamina or CS.NoDodgeCooldown or CS.AntiStun or CS.AntiRagdoll or Dbg.StunEvents then
-        CS.NamecallHooked = false
-        hookNamecall()
-    end
     if CS.AntiStun or CS.AntiRagdoll then
         task.defer(attachAntiStun, character)
     end
@@ -1887,7 +2023,7 @@ local function rhythmLane(note)
 end
 
 local function rhythmRegister(note)
-    if not Rhythm.Enabled or not rhythmIsNote(note) or not note.Visible then return end
+    if not Rhythm.Enabled or not rhythmIsNote(note) then return end
     local attrLane = note:GetAttribute("NoteLane")
     local lane = (type(attrLane) == "number" and attrLane >= 1 and attrLane <= Rhythm.LaneCount)
         and attrLane or rhythmLane(note)
@@ -1910,6 +2046,15 @@ local function rhythmRegister(note)
     rhythmDebug("NOTE", "registered", note, "lane=", lane,
         "noteTime=", Rhythm.Active[note].noteTime,
         "pos=", note.AbsolutePosition, "size=", note.AbsoluteSize)
+end
+
+local function rhythmConnectNoteWatcher(root)
+    if Rhythm.NoteConn then Rhythm.NoteConn:Disconnect() end
+    if Rhythm.NoteRemoveConn then Rhythm.NoteRemoveConn:Disconnect() end
+    Rhythm.NoteConn = root.DescendantAdded:Connect(rhythmRegister)
+    Rhythm.NoteRemoveConn = root.DescendantRemoving:Connect(function(note)
+        Rhythm.Active[note] = nil
+    end)
 end
 
 local function rhythmResetRecycled(note, data)
@@ -1950,6 +2095,10 @@ local function rhythmConnectRatingSpy(root)
         Rhythm.RatingRemoveConn:Disconnect()
         Rhythm.RatingRemoveConn = nil
     end
+    for _, connection in pairs(Rhythm.RatingTextConns) do
+        connection:Disconnect()
+    end
+    table.clear(Rhythm.RatingTextConns)
     if not Rhythm.RatingSpy or not root or not root.Parent then return end
     local seenRatings = setmetatable({}, { __mode = "k" })
     local ratingKeywords = { "perfect", "great", "good", "ok", "miss", "bad" }
@@ -2000,7 +2149,7 @@ local function rhythmConnectRatingSpy(root)
     local function watchRating(obj)
         checkRating(obj)
         if obj:IsA("TextLabel") or obj:IsA("TextButton") then
-            obj:GetPropertyChangedSignal("Text"):Connect(function()
+            Rhythm.RatingTextConns[obj] = obj:GetPropertyChangedSignal("Text"):Connect(function()
                 checkRating(obj)
             end)
         end
@@ -2008,6 +2157,11 @@ local function rhythmConnectRatingSpy(root)
     Rhythm.RatingConn = root.DescendantAdded:Connect(watchRating)
     Rhythm.RatingRemoveConn = root.DescendantRemoving:Connect(function(obj)
         seenRatings[obj] = nil
+        local connection = Rhythm.RatingTextConns[obj]
+        if connection then
+            connection:Disconnect()
+            Rhythm.RatingTextConns[obj] = nil
+        end
     end)
     for _, obj in ipairs(root:GetDescendants()) do
         if obj:IsA("TextLabel") or obj:IsA("TextButton") then
@@ -2060,8 +2214,9 @@ local function rhythmScan()
         Rhythm.Root = root
         if not rhythmConfigure(root) then return end
         rhythmConnectRatingSpy(root)
+        rhythmConnectNoteWatcher(root)
+        for _, object in ipairs(root:GetDescendants()) do rhythmRegister(object) end
     end
-    for _, object in ipairs(root:GetDescendants()) do rhythmRegister(object) end
 end
 
 local function rhythmDebugStructure()
@@ -2354,7 +2509,9 @@ end
 local function rhythmStep()
     if not Rhythm.Enabled then return end
     local now = os.clock()
-    if not Rhythm.Root or now - Rhythm.LastScan >= Rhythm.ScanInterval then
+    local profileStartedAt = RuntimeProfiler.Enabled and now or nil
+    if (not Rhythm.Root or not Rhythm.Root.Parent)
+        and now - Rhythm.LastScan >= Rhythm.ScanInterval then
         Rhythm.LastScan = now
         rhythmScan()
     end
@@ -2364,7 +2521,9 @@ local function rhythmStep()
         rhythmDebugStructure()
     end
 
-    local songTimeVotes = {}
+    local songTimeVotes = Rhythm._songTimeVotes or {}
+    Rhythm._songTimeVotes = songTimeVotes
+    table.clear(songTimeVotes)
 
     for note, data in pairs(Rhythm.Active) do
         if not note.Parent then
@@ -2483,6 +2642,10 @@ local function rhythmStep()
         Rhythm.SongTime = sum / #songTimeVotes
         Rhythm.LastSongTimeAt = now
     end
+    if profileStartedAt then
+        RuntimeProfiler.RhythmFrames += 1
+        RuntimeProfiler.RhythmTime += os.clock() - profileStartedAt
+    end
 end
 
 local function setRhythmEnabled(value)
@@ -2495,8 +2658,20 @@ local function setRhythmEnabled(value)
         Rhythm.ScrollSpeed = nil
         Rhythm.SongTime = nil
         Rhythm.SongTimeSamples = {}
+        Rhythm.Root = nil
         if Rhythm.RatingConn then
             Rhythm.RatingConn:Disconnect(); Rhythm.RatingConn = nil
+        end
+        if Rhythm.RatingRemoveConn then
+            Rhythm.RatingRemoveConn:Disconnect(); Rhythm.RatingRemoveConn = nil
+        end
+        for _, connection in pairs(Rhythm.RatingTextConns) do connection:Disconnect() end
+        table.clear(Rhythm.RatingTextConns)
+        if Rhythm.NoteConn then
+            Rhythm.NoteConn:Disconnect(); Rhythm.NoteConn = nil
+        end
+        if Rhythm.NoteRemoveConn then
+            Rhythm.NoteRemoveConn:Disconnect(); Rhythm.NoteRemoveConn = nil
         end
         if Rhythm.RenderConn then
             Rhythm.RenderConn:Disconnect()
@@ -2549,78 +2724,19 @@ PlayerGui.ChildRemoved:Connect(function(child)
         if Rhythm.RatingConn then
             Rhythm.RatingConn:Disconnect(); Rhythm.RatingConn = nil
         end
+        if Rhythm.RatingRemoveConn then
+            Rhythm.RatingRemoveConn:Disconnect(); Rhythm.RatingRemoveConn = nil
+        end
+        for _, connection in pairs(Rhythm.RatingTextConns) do connection:Disconnect() end
+        table.clear(Rhythm.RatingTextConns)
+        if Rhythm.NoteConn then
+            Rhythm.NoteConn:Disconnect(); Rhythm.NoteConn = nil
+        end
+        if Rhythm.NoteRemoveConn then
+            Rhythm.NoteRemoveConn:Disconnect(); Rhythm.NoteRemoveConn = nil
+        end
     end
 end)
-
-local AutoRespawn = { Enabled = false, Conn = nil, Triggered = false, WaitingRevive = false }
-
-local function arDebug(...)
-    if not Dbg.ArDebug then return end
-    local parts = {}
-    for _, v in ipairs({ ... }) do
-        table.insert(parts, tostring(v))
-    end
-    local msg = table.concat(parts, " ")
-    print("[AutoRespawn]", msg)
-    table.insert(Dbg.ArTimeline, os.date("!%H:%M:%S") .. " " .. msg)
-    if #Dbg.ArTimeline > 200 then
-        table.remove(Dbg.ArTimeline, 1)
-    end
-end
-
-local function triggerAutoRespawn()
-    if AutoRespawn.Triggered then
-        arDebug("already triggered, skipping")
-        return
-    end
-    AutoRespawn.Triggered = true
-    arDebug("trigger called")
-    local char = LocalPlayer.Character
-    if not char then
-        arDebug("no character, aborting")
-        AutoRespawn.Triggered = false
-        return
-    end
-    local hrp = char:FindFirstChild("HumanoidRootPart")
-    if not hrp then
-        arDebug("no HRP, aborting")
-        AutoRespawn.Triggered = false
-        return
-    end
-    arDebug("teleporting out of bounds")
-    pcall(function()
-        hrp.Anchored = true
-        hrp.CFrame = CFrame.new(0, 99999, 0)
-    end)
-    arDebug("teleport done")
-end
-
-local function attachAutoRespawn(character)
-    if not character or not AutoRespawn.Enabled then return end
-    arDebug("attaching to character", character.Name)
-    if AutoRespawn.Conn then AutoRespawn.Conn:Disconnect() end
-    AutoRespawn.Conn = character.AttributeChanged:Connect(function(attr)
-        local val = character:GetAttribute(attr)
-        arDebug("AttributeChanged:", attr, "=", tostring(val))
-        if attr == "Downed" and val == true then
-            arDebug("knocked, waiting for revive...")
-            AutoRespawn.WaitingRevive = true
-        end
-        if attr == "Downed" and val == false and AutoRespawn.WaitingRevive then
-            arDebug("revived! triggering respawn...")
-            AutoRespawn.WaitingRevive = false
-            task.wait(0.1)
-            task.defer(triggerAutoRespawn)
-        end
-    end)
-end
-
-local function detachAutoRespawn()
-    if AutoRespawn.Conn then
-        AutoRespawn.Conn:Disconnect()
-        AutoRespawn.Conn = nil
-    end
-end
 
 local Fly = { Enabled = false, Speed = 50, BV = nil, BG = nil, Conn = nil, Humanoid = nil, Root = nil }
 
@@ -2730,12 +2846,6 @@ LocalPlayer.CharacterAdded:Connect(function(character)
         task.wait(0.3)
         enableNoclip()
     end
-    if AutoRespawn.Enabled then
-        AutoRespawn.Triggered = false
-        AutoRespawn.WaitingRevive = false
-        task.wait(0.5)
-        attachAutoRespawn(character)
-    end
 end)
 
 local PlayerTab = Window:Tab({ Title = "Player", Icon = "move" })
@@ -2830,27 +2940,6 @@ PlayerTab:Toggle({
         else
             disableNoclip()
             notify("No Clip", "Disabled", 2)
-        end
-    end
-})
-
-PlayerTab:Divider()
-
-PlayerTab:Section({ Title = "Auto Respawn", TextSize = 20 })
-
-PlayerTab:Toggle({
-    Title = "Auto Respawn",
-    Description = "Auto respawn when knocked by teleporting out of bounds",
-    Default = false,
-    Callback = function(value)
-        AutoRespawn.Enabled = value
-        if value then
-            local char = LocalPlayer.Character
-            if char then attachAutoRespawn(char) end
-            notify("Auto Respawn", "Enabled", 2)
-        else
-            detachAutoRespawn()
-            notify("Auto Respawn", "Disabled", 2)
         end
     end
 })
@@ -2960,6 +3049,7 @@ AutoParryTab:Toggle({
         AutoParry.ParryToken += 1
         AutoParry.PendingParry = {}
         releaseBlock()
+        refreshAnimationWatchers()
         if Value then
             debugLog("[BagahHub STATE]", "Perfect Auto Parry enabled")
             notify("✨ Perfect Auto Parry", "ON - automatic M1/M2 timing", 2)
@@ -3005,6 +3095,7 @@ AutoParryTab:Toggle({
     Callback = function(Value)
         AutoParry.GrappleAwareEnabled = Value
         AutoParry.LastGrappleDodge = 0
+        refreshAnimationWatchers()
         debugLog("[BagahHub STATE]", "Grapple-Aware Combat",
             Value and "enabled" or "disabled")
         if Value then
@@ -3201,6 +3292,32 @@ if DEBUG_TAB_ENABLED then
         end
     })
 
+    DebugTab:Toggle({
+        Title = "Runtime Profiler",
+        Description = "Capture simulation/render FPS, hitches, combat and animator callback counts every 2 seconds; use Copy Latest Runtime Profile to read it",
+        Default = false,
+        Callback = function(value)
+            if value then
+                startRuntimeProfiler()
+            else
+                stopRuntimeProfiler()
+            end
+        end
+    })
+
+    DebugTab:Button({
+        Title = "Copy Latest Runtime Profile",
+        Description = "Copy the latest 2-second runtime profiler report",
+        Callback = function()
+            local success = pcall(function()
+                setclipboard(RuntimeProfiler.LastReport)
+            end)
+            if not success then
+                warn("[BagahHub PROFILE] Clipboard unavailable:", RuntimeProfiler.LastReport)
+            end
+        end
+    })
+
     DebugTab:Button({
         Title = "Copy Active Debug Logs",
         Description = "Copy whichever debug logs are currently enabled (same as F8)",
@@ -3268,20 +3385,6 @@ if DEBUG_TAB_ENABLED then
     })
 
     DebugTab:Divider()
-
-    DebugTab:Toggle({
-        Title = "Auto Respawn Debug",
-        Description = "Log knock detection and teleport trigger events",
-        Default = false,
-        Callback = function(value)
-            Dbg.ArDebug = value
-            if value then
-                table.clear(Dbg.ArTimeline)
-                arDebug("debug enabled")
-                arDebug("AutoRespawnEnabled=" .. tostring(AutoRespawn.Enabled))
-            end
-        end
-    })
 end
 
 -- ========================================================================= --
@@ -3405,6 +3508,17 @@ local function espClearModel(model)
     end
 end
 
+local function espHideModel(model)
+    local objs = ESP.Objects[model]
+    if objs then
+        for _, drawing in pairs(objs) do
+            drawing.Visible = false
+        end
+    end
+    local highlight = ESP.Highlights[model]
+    if highlight then highlight.Enabled = false end
+end
+
 local function espUpdateModel(model)
     if not espHasEnabledFeature() then
         espClearModel(model)
@@ -3413,7 +3527,7 @@ local function espUpdateModel(model)
 
     local char = espGetCharacter(model)
     if not char then
-        espClearModel(model)
+        espHideModel(model)
         return
     end
 
@@ -3423,7 +3537,7 @@ local function espUpdateModel(model)
     -- ── Distance check (uses cached localRoot from espRender) ─────── --
     local dist = ESP.FrameLocalRoot and (ESP.FrameLocalRoot.Position - char.HRP.Position).Magnitude or math.huge
     if dist > ESP.MaxDistance then
-        espClearModel(model)
+        espHideModel(model)
         return
     end
 
@@ -3436,7 +3550,7 @@ local function espUpdateModel(model)
     local bot, botVis = cam:WorldToViewportPoint(bottomPos)
 
     if not (topVis or botVis) then
-        espClearModel(model)
+        espHideModel(model)
         return
     end
 
@@ -3610,9 +3724,6 @@ local function espRender()
     if not ESP.WorkspacePlayers or not ESP.WorkspacePlayers.Parent then
         ESP.WorkspacePlayers = workspace:FindFirstChild("Players")
     end
-    if not ESP.WorkspaceNpcs or not ESP.WorkspaceNpcs.Parent then
-        ESP.WorkspaceNpcs = workspace:FindFirstChild("NPCs")
-    end
 
     -- Cache local root once per frame (not per model)
     local localChar = LocalPlayer.Character
@@ -3623,14 +3734,6 @@ local function espRender()
 
     if ESP.WorkspacePlayers then
         for _, model in ESP.WorkspacePlayers:GetChildren() do
-            if ESP.Generation ~= gen then return end
-            active[model] = true
-            espUpdateModel(model)
-        end
-    end
-
-    if ESP.WorkspaceNpcs then
-        for _, model in ESP.WorkspaceNpcs:GetChildren() do
             if ESP.Generation ~= gen then return end
             active[model] = true
             espUpdateModel(model)
@@ -4141,7 +4244,14 @@ Window:SelectTab(1)
 -- ========================================================================= --
 task.spawn(function()
     while true do
-        if espHasEnabledFeature() then espRender() end
+        if espHasEnabledFeature() then
+            local profileStartedAt = RuntimeProfiler.Enabled and os.clock() or nil
+            espRender()
+            if profileStartedAt then
+                RuntimeProfiler.EspFrames += 1
+                RuntimeProfiler.EspTime += os.clock() - profileStartedAt
+            end
+        end
         task.wait(0.033) -- ~30fps, 2D drawings don't need 60fps
     end
 end)
