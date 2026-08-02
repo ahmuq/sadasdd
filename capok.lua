@@ -1,1171 +1,15 @@
--- ========================================================================= --
---                                  SERVICES                                  --
--- ========================================================================= --
-local RunService          = game:GetService("RunService")
-local Players             = game:GetService("Players")
-local LocalPlayer         = Players.LocalPlayer
-local ReplicatedStorage   = game:GetService("ReplicatedStorage")
-local UserInputService    = game:GetService("UserInputService")
-local VirtualInputManager = game:GetService("VirtualInputManager")
-local VirtualUser         = game:GetService("VirtualUser")
-local GuiService          = game:GetService("GuiService")
-
--- ========================================================================= --
---                                 DEV FLAGS                                   --
--- ========================================================================= --
-local DEBUG_TAB_ENABLED   = true -- set to false before publishing
-local NO_UI_TEST_MODE     = false
-
--- ========================================================================= --
---                                  REMOTES                                   --
--- ========================================================================= --
-local RemotesServer       = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("Server")
-local CombatClientRemote  = ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Network"):WaitForChild(
-    "CombatClientRemoteEvent")
-local RemotesFolder       = ReplicatedStorage:WaitForChild("Remotes")
-local SprintRemote        = RemotesFolder:FindFirstChild("Sprint")
-local SprintUpdateRemote  = RemotesFolder:FindFirstChild("SprintUpdate")
-
-
--- ========================================================================= --
---                               AUTO PARRY STATE                             --
--- ========================================================================= --
-local AutoParry            = {
-    Enabled = false,
-    PerfectEnabled = false,
-    AnimationSyncEnabled = false,
-    FacingEnabled = false,
-    GrappleAwareEnabled = false,
-    LastGrappleDodge = 0,
-    AutoPunishEnabled = false,
-    LastAutoPunish = 0,
-    IsBlocking = false,
-    BlockToken = 0,
-    LastPerfectResult = 0,
-    LastBlockResult = 0,
-    FacingHumanoid = nil,
-    PreviousAutoRotate = nil,
-    DefaultImpactTime = 0.35,
-    ImpactLead = 0.06,
-    ParryDuration = 0.30,
-    MinParryDelay = 0.01,
-    MaxDistance = 6,
-    ParryToken = 0,
-    LastSwing = {},
-    PendingParry = {},
-    RecentAttackAnimations = {},
-    LearnedImpactTime = {},
-    Notification = false,
-    TotalPerfectBlocks = 0,
-    TotalBlocks = 0,
-    TotalParries = 0,
-    -- New features
-    FaceLockEnabled = false,
-    FaceTargetRange = 7,
-    BlockM1Enabled = false,
-    BlockM1Active = false,
-    ComboHoldEnabled = false,
-    ComboHoldExtra = 0.35,
-    FacingCheckEnabled = false,
-    PingAdjustPercent = 100,
-    SmoothedPing = 0,
-    LastPingSample = 0,
-    -- Fallback safety block: hold block when parry isn't possible
-    FallbackBlockEnabled = false,
-    FallbackBlockDuration = 0.45,
-    FallbackBlockRange = 12,
-    LastFallbackBlock = 0,
-    FaceLockConn = nil,
-}
-
-local PERFECT_PARRY_CONFIG = {
-    MinDelay = 0.01,
-    HoldTime = 0.30,
-    MaxDistance = 18,
-    M1ImpactTime = 0.42,
-    M2ImpactTime = 0.61,
-    InputLead = 0.09,
-    MaxSyncCorrection = 0.12,
-}
-
--- ── Per-combat-style impact timing ─────────────────────────────────────── --
--- Seconds from animation start to the hit actually landing, per style.
--- Key = lowercase style-folder fragment found in the registry path
--- (e.g. "boxing" matches ReplicatedStorage.Animations.Combat.BoxingAnims...).
--- `m1` = lead/reach attacks (1st/4th M1), `chain` = fast chain hits (2nd/3rd M1).
--- Tune these per style; faster styles need smaller values.
-local STYLE_IMPACT_TIMES   = {
-    boxing    = { m1 = 0.30, chain = 0.32 }, -- fast punches
-    striker   = { m1 = 0.34, chain = 0.35 }, -- fast strikes
-    kure      = { m1 = 0.34, chain = 0.36 }, -- fast assassination style
-    karate    = { m1 = 0.38, chain = 0.39 }, -- disciplined, medium
-    capoeira  = { m1 = 0.40, chain = 0.41 }, -- spinning kicks
-    hakari    = { m1 = 0.40, chain = 0.42 }, -- medium
-    basic     = { m1 = 0.42, chain = 0.40 }, -- baseline default
-    muaythai  = { m1 = 0.45, chain = 0.44 }, -- heavy kicks / elbows
-    wrestling = { m1 = 0.48, chain = 0.46 }, -- grappling, slow
-    slugger   = { m1 = 0.50, chain = 0.48 }, -- heavy haymakers
-}
-
--- Returns the style key for a registry path, or nil if unknown/base.
-local function getCombatStyleFromPath(lowerPath)
-    for style in STYLE_IMPACT_TIMES do
-        if string.find(lowerPath, style, 1, true) then
-            return style
-        end
-    end
-    return nil
-end
-
-local function getPerfectDefaultImpactTime(registryPath)
-    local lowerPath = string.lower(registryPath)
-    if string.find(lowerPath, "m2", 1, true) then
-        return PERFECT_PARRY_CONFIG.M2ImpactTime
-    end
-    local isChain = string.find(lowerPath, "2ndm1", 1, true)
-        or string.find(lowerPath, "3rdm1", 1, true)
-
-    -- Style-specific timing (covers Boxing, Karate, MuayThai, Slugger, etc.)
-    local style = getCombatStyleFromPath(lowerPath)
-    if style then
-        local timing = STYLE_IMPACT_TIMES[style]
-        return isChain and timing.chain or timing.m1
-    end
-
-    -- Unknown / base style fallback
-    if isChain then
-        return 0.40
-    end
-    if string.find(lowerPath, "1stm1", 1, true)
-        or string.find(lowerPath, "4thm1", 1, true) then
-        return 0.43
-    end
-    return PERFECT_PARRY_CONFIG.M1ImpactTime
-end
-
-local function isAnyAutoParryEnabled()
-    return AutoParry.Enabled or AutoParry.PerfectEnabled
-end
-
--- ── Mobile detection: auto-compensate for lower FPS / scheduler jitter ── --
--- Extra lead (seconds) added on mobile to counter task.delay granularity
-local MOBILE_EXTRA_LEAD = (UserInputService.TouchEnabled
-    and not UserInputService.MouseEnabled
-    and not UserInputService.KeyboardEnabled) and 0.04 or 0
-
-local function getNetworkOneWayTime()
-    local now = os.clock()
-    if now - AutoParry.LastPingSample > 0.5 then
-        AutoParry.LastPingSample = now
-        local success, ping = pcall(function()
-            return LocalPlayer:GetNetworkPing()
-        end)
-        local raw = success and math.clamp(ping, 0, 0.5) or 0
-        -- Smoothed ping (EMA) to avoid jitter
-        AutoParry.SmoothedPing = AutoParry.SmoothedPing * 0.7 + raw * 0.3
-    end
-    -- Full round-trip * adjust%
-    return AutoParry.SmoothedPing * (AutoParry.PingAdjustPercent / 100)
-end
-
-local function getAnimationSyncCorrection(track)
-    local success, timePosition, speed = pcall(function()
-        return track.TimePosition, track.Speed
-    end)
-    if not success or type(timePosition) ~= "number" or type(speed) ~= "number"
-        or timePosition < 0 or speed <= 0.05 or speed > 4 then
-        return 0, false
-    end
-
-    local correction = math.clamp(timePosition / speed,
-        0, PERFECT_PARRY_CONFIG.MaxSyncCorrection)
-    return correction, correction > 0.001
-end
-
--- ========================================================================= --
---                               PARRY FUNCTION                               --
--- ========================================================================= --
-local Dbg = {
-    Events = false,
-    CopyKey = Enum.KeyCode.F8,
-    Timeline = {},
-    StartedAt = os.clock(),
-    StunEvents = false,
-    StunTimeline = {},
-    StunStartedAt = os.clock(),
-}
-
-local EspHealthDebug = { Enabled = false, LastState = {}, Timeline = {} }
-local HudHealthDebug = { Enabled = false, LastState = nil, Timeline = {} }
-
-local RuntimeProfiler = {
-    Enabled = false,
-    Conn = nil,
-    RenderConn = nil,
-    Interval = 2,
-    LastReportAt = 0,
-    LastReport = "No runtime profile captured yet.",
-}
-
-local function resetRuntimeProfileCounters()
-    RuntimeProfiler.Frames = 0
-    RuntimeProfiler.FrameTime = 0
-    RuntimeProfiler.MaxFrameTime = 0
-    RuntimeProfiler.Hitches = 0
-    RuntimeProfiler.RenderFrames = 0
-    RuntimeProfiler.RenderFrameTime = 0
-    RuntimeProfiler.RenderMaxFrameTime = 0
-    RuntimeProfiler.RenderHitches = 0
-    RuntimeProfiler.CombatEvents = 0
-    RuntimeProfiler.WatchedAnimations = 0
-    RuntimeProfiler.AnimationEvents = 0
-    RuntimeProfiler.RelevantAnimations = 0
-    RuntimeProfiler.FaceLockTicks = 0
-    RuntimeProfiler.EspFrames = 0
-    RuntimeProfiler.EspTime = 0
-    RuntimeProfiler.RhythmFrames = 0
-    RuntimeProfiler.RhythmTime = 0
-    RuntimeProfiler.Namecalls = 0
-    RuntimeProfiler.ParryScheduled = 0
-    RuntimeProfiler.ParryTriggered = 0
-    RuntimeProfiler.ParryTriggeredPlannedTime = 0
-    RuntimeProfiler.ParryActualTime = 0
-end
-
-local function stopRuntimeProfiler()
-    RuntimeProfiler.Enabled = false
-    if RuntimeProfiler.Conn then
-        RuntimeProfiler.Conn:Disconnect()
-        RuntimeProfiler.Conn = nil
-    end
-    if RuntimeProfiler.RenderConn then
-        RuntimeProfiler.RenderConn:Disconnect()
-        RuntimeProfiler.RenderConn = nil
-    end
-end
-
-local function startRuntimeProfiler()
-    if RuntimeProfiler.Conn then
-        RuntimeProfiler.Enabled = true
-        return
-    end
-    RuntimeProfiler.Enabled = true
-    RuntimeProfiler.LastReportAt = os.clock()
-    resetRuntimeProfileCounters()
-    RuntimeProfiler.RenderConn = RunService.RenderStepped:Connect(function(dt)
-        if not RuntimeProfiler.Enabled then return end
-        RuntimeProfiler.RenderFrames += 1
-        RuntimeProfiler.RenderFrameTime += dt
-        RuntimeProfiler.RenderMaxFrameTime = math.max(RuntimeProfiler.RenderMaxFrameTime, dt)
-        if dt >= 0.05 then RuntimeProfiler.RenderHitches += 1 end
-    end)
-    RuntimeProfiler.Conn = RunService.Heartbeat:Connect(function(dt)
-        if not RuntimeProfiler.Enabled then return end
-        RuntimeProfiler.Frames += 1
-        RuntimeProfiler.FrameTime += dt
-        RuntimeProfiler.MaxFrameTime = math.max(RuntimeProfiler.MaxFrameTime, dt)
-        if dt >= 0.05 then RuntimeProfiler.Hitches += 1 end
-
-        local now = os.clock()
-        local elapsed = now - RuntimeProfiler.LastReportAt
-        if elapsed < RuntimeProfiler.Interval then return end
-
-        local fps = RuntimeProfiler.FrameTime > 0
-            and RuntimeProfiler.Frames / RuntimeProfiler.FrameTime or 0
-        local renderFps = RuntimeProfiler.RenderFrameTime > 0
-            and RuntimeProfiler.RenderFrames / RuntimeProfiler.RenderFrameTime or 0
-        local plannedParryMs = RuntimeProfiler.ParryTriggered > 0
-            and RuntimeProfiler.ParryTriggeredPlannedTime / RuntimeProfiler.ParryTriggered * 1000 or 0
-        local actualParryMs = RuntimeProfiler.ParryTriggered > 0
-            and RuntimeProfiler.ParryActualTime / RuntimeProfiler.ParryTriggered * 1000 or 0
-        RuntimeProfiler.LastReport = string.format(
-            "[BagahHub PROFILE] %.1fs | sim %.1fFPS %.1fms/%d | render %.1fFPS %.1fms/%d | combat %d | anim %d/%d/%d | parry %d/%d %.1f/%.1fms | face %d | ESP %d %.2fms | rhythm %d %.2fms | namecalls %d",
-            elapsed, fps, RuntimeProfiler.MaxFrameTime * 1000, RuntimeProfiler.Hitches,
-            renderFps, RuntimeProfiler.RenderMaxFrameTime * 1000, RuntimeProfiler.RenderHitches,
-            RuntimeProfiler.CombatEvents, RuntimeProfiler.RelevantAnimations,
-            RuntimeProfiler.AnimationEvents, RuntimeProfiler.WatchedAnimations,
-            RuntimeProfiler.ParryTriggered, RuntimeProfiler.ParryScheduled, plannedParryMs, actualParryMs,
-            RuntimeProfiler.FaceLockTicks,
-            RuntimeProfiler.EspFrames, RuntimeProfiler.EspTime * 1000,
-            RuntimeProfiler.RhythmFrames, RuntimeProfiler.RhythmTime * 1000,
-            RuntimeProfiler.Namecalls)
-        RuntimeProfiler.LastReportAt = now
-        resetRuntimeProfileCounters()
-    end)
-end
-
-if NO_UI_TEST_MODE then
-    UserInputService.InputBegan:Connect(function(input, processed)
-        if processed then return end
-        if input.KeyCode == Enum.KeyCode.F7 then
-            if RuntimeProfiler.Enabled then
-                stopRuntimeProfiler()
-            else
-                startRuntimeProfiler()
-            end
-        elseif input.KeyCode == Enum.KeyCode.F8 then
-            pcall(function() setclipboard(RuntimeProfiler.LastReport) end)
-        end
-    end)
-end
-
-local function debugLog(...)
-    if not Dbg.Events then return end
-    local values = { ... }
-    for index, value in values do
-        values[index] = tostring(value)
-    end
-
-    local line = string.format("+%.6f | %s", os.clock() - Dbg.StartedAt,
-        table.concat(values, " "))
-    table.insert(Dbg.Timeline, line)
-    if #Dbg.Timeline > 1500 then
-        table.remove(Dbg.Timeline, 1)
-    end
-    print(line)
-end
-
-local function getAutoParryDebugOutput()
-    local header = table.concat({
-        "BagahHub Gakuran Auto Parry Debug",
-        "Copied: " .. os.date("!%Y-%m-%dT%H:%M:%SZ"),
-        "ImpactLead: " .. tostring(AutoParry.ImpactLead),
-        "ParryDuration: " .. tostring(AutoParry.ParryDuration),
-        "MinParryDelay: " .. tostring(AutoParry.MinParryDelay),
-        "MaxDistance: " .. tostring(AutoParry.MaxDistance),
-        "PerfectBlocks: " .. tostring(AutoParry.TotalPerfectBlocks),
-        "Blocks: " .. tostring(AutoParry.TotalBlocks),
-        "ParryAttempts: " .. tostring(AutoParry.TotalParries),
-        "--- TIMELINE ---",
-    }, "\n")
-    return header .. "\n" .. table.concat(Dbg.Timeline, "\n")
-end
-
-local function stunDebugValue(value, depth)
-    depth = depth or 0
-    local valueType = typeof(value)
-    if valueType == "Instance" then return tostring(value) end
-    if valueType ~= "table" then return tostring(value) end
-    if depth >= 2 then return "{...}" end
-
-    local values = {}
-    local count = 0
-    for key, child in pairs(value) do
-        count += 1
-        if count > 16 then
-            table.insert(values, "...")
-            break
-        end
-        table.insert(values, tostring(key) .. "=" .. stunDebugValue(child, depth + 1))
-    end
-    return "{" .. table.concat(values, ", ") .. "}"
-end
-
-local function stunDebugLog(tag, ...)
-    if not Dbg.StunEvents then return end
-    local values = { ... }
-    for index, value in ipairs(values) do
-        values[index] = stunDebugValue(value)
-    end
-    local line = string.format("+%.6f | [STUN %s] %s",
-        os.clock() - Dbg.StunStartedAt, tag, table.concat(values, " "))
-    table.insert(Dbg.StunTimeline, line)
-    if #Dbg.StunTimeline > 2000 then table.remove(Dbg.StunTimeline, 1) end
-    print(line)
-end
-
-local function getStunDebugOutput()
-    local character = LocalPlayer.Character
-    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-    local header = table.concat({
-        "BagahHub Gakuran Stun/Ragdoll Debug",
-        "Copied: " .. os.date("!%Y-%m-%dT%H:%M:%SZ"),
-        "HumanoidState: " .. tostring(humanoid and humanoid:GetState() or "none"),
-        "--- TIMELINE ---",
-    }, "\n")
-    return header .. "\n" .. table.concat(Dbg.StunTimeline, "\n")
-end
-
-UserInputService.InputBegan:Connect(function(input, gameProcessed)
-    if not Dbg.StunEvents then return end
-    local inputName = input.UserInputType == Enum.UserInputType.Keyboard
-        and input.KeyCode.Name or input.UserInputType.Name
-    stunDebugLog("INPUT BEGIN", inputName, "processed=", gameProcessed)
-end)
-
-UserInputService.InputEnded:Connect(function(input, gameProcessed)
-    if not Dbg.StunEvents then return end
-    local inputName = input.UserInputType == Enum.UserInputType.Keyboard
-        and input.KeyCode.Name or input.UserInputType.Name
-    stunDebugLog("INPUT END", inputName, "processed=", gameProcessed)
-end)
-
-
-local function holdBlock()
-    AutoParry.BlockToken += 1
-    local blockToken = AutoParry.BlockToken
-    if AutoParry.IsBlocking then return blockToken end
-    AutoParry.IsBlocking = true
-    RemotesServer:FireServer({
-        Type = "Combat",
-        Action = "Block",
-        Func = "Activated"
-    }, tick())
-    debugLog("[BagahHub BLOCK]", "HELD", "serverTime:", workspace:GetServerTimeNow())
-    return blockToken
-end
-
-local function restoreParryFacing()
-    local humanoid = AutoParry.FacingHumanoid
-    if humanoid and humanoid.Parent and AutoParry.PreviousAutoRotate ~= nil then
-        humanoid.AutoRotate = AutoParry.PreviousAutoRotate
-    end
-    AutoParry.FacingHumanoid = nil
-    AutoParry.PreviousAutoRotate = nil
-end
-
-local function releaseBlock(expectedToken)
-    if expectedToken and expectedToken ~= AutoParry.BlockToken then return end
-    if not AutoParry.IsBlocking then
-        restoreParryFacing()
-        return
-    end
-    AutoParry.IsBlocking = false
-    RemotesServer:FireServer({
-        Type = "Combat",
-        Action = "Block",
-        Func = "Deactivated"
-    })
-    restoreParryFacing()
-    debugLog("[BagahHub BLOCK]", "RELEASED", "serverTime:", workspace:GetServerTimeNow())
-end
-
-local CombatModelCache = {}
-local CombatRootCache = {}
-
-local function getCombatModel(modelName)
-    local cached = CombatModelCache[modelName]
-    if cached and cached.Parent then return cached end
-
-    local workspacePlayers = workspace:FindFirstChild("Players")
-    local workspaceNpcs = workspace:FindFirstChild("NPCs")
-    local model = workspacePlayers and workspacePlayers:FindFirstChild(modelName)
-        or workspaceNpcs and workspaceNpcs:FindFirstChild(modelName)
-    local player = Players:FindFirstChild(modelName)
-    model = model or player and player.Character
-    if model then CombatModelCache[modelName] = model end
-    return model
-end
-
-local function getCombatRoot(model)
-    if not model then return nil end
-    local cached = CombatRootCache[model]
-    if cached and cached.Parent == model then return cached end
-
-    local root = model:FindFirstChild("HumanoidRootPart")
-    CombatRootCache[model] = root
-    return root
-end
-
-local function faceAttacker(attackerName)
-    if not AutoParry.FacingEnabled then return end
-
-    local localModel = LocalPlayer.Character or getCombatModel(LocalPlayer.Name)
-    local attackerModel = getCombatModel(attackerName)
-    local localRoot = getCombatRoot(localModel)
-    local attackerRoot = getCombatRoot(attackerModel)
-    local humanoid = localModel and localModel:FindFirstChildOfClass("Humanoid")
-    if not localRoot or not attackerRoot or not humanoid then return end
-
-    -- Only face if within FaceTargetRange
-    local dist = (attackerRoot.Position - localRoot.Position).Magnitude
-    if dist > AutoParry.FaceTargetRange then return end
-
-    local targetPosition = Vector3.new(attackerRoot.Position.X,
-        localRoot.Position.Y, attackerRoot.Position.Z)
-    if (targetPosition - localRoot.Position).Magnitude < 0.01 then return end
-
-    if AutoParry.FacingHumanoid ~= humanoid then
-        restoreParryFacing()
-        AutoParry.FacingHumanoid = humanoid
-        AutoParry.PreviousAutoRotate = humanoid.AutoRotate
-    end
-    humanoid.AutoRotate = false
-    localRoot.CFrame = CFrame.lookAt(localRoot.Position, targetPosition)
-    debugLog("[BagahHub FACING]", "turned toward", attackerName)
-end
-
-local function getAttackerDistance(attackerName, attackerModel)
-    attackerModel = attackerModel or getCombatModel(attackerName)
-
-    local localModel = LocalPlayer.Character or getCombatModel(LocalPlayer.Name)
-    local localRoot = getCombatRoot(localModel)
-    local attackerRoot = getCombatRoot(attackerModel)
-    if not localRoot or not attackerRoot then return math.huge end
-    return (localRoot.Position - attackerRoot.Position).Magnitude
-end
-
--- ── Facing Check: only parry attackers actually facing you ───────────── --
-local function isAttackerFacingMe(attackerName, maxAngle)
-    local attackerModel = getCombatModel(attackerName)
-    local attackerRoot = getCombatRoot(attackerModel)
-    local localModel = LocalPlayer.Character or getCombatModel(LocalPlayer.Name)
-    local localRoot = getCombatRoot(localModel)
-    if not attackerRoot or not localRoot then return true end -- can't tell, allow parry
-    local toMe = (localRoot.Position - attackerRoot.Position)
-    if toMe.Magnitude < 0.01 then return true end
-    toMe = toMe.Unit
-    local look = attackerRoot.CFrame.LookVector
-    local dot = look:Dot(toMe)
-    -- dot > cos(angle): 0.5 = 60deg, 0 = 90deg
-    return dot > (maxAngle or 0.3)
-end
-
--- ── Face Lock: rotate toward nearest enemy continuously ──────────────── --
-
-local function stopFaceLock()
-    if AutoParry.FaceLockConn then
-        AutoParry.FaceLockConn:Disconnect()
-        AutoParry.FaceLockConn = nil
-    end
-    restoreParryFacing()
-end
-
-local function startFaceLock()
-    if AutoParry.FaceLockConn then return end
-    AutoParry.FaceLockConn = RunService.Heartbeat:Connect(function()
-        if not AutoParry.FaceLockEnabled then
-            stopFaceLock()
-            return
-        end
-        if RuntimeProfiler.Enabled then RuntimeProfiler.FaceLockTicks += 1 end
-        local char = LocalPlayer.Character
-        if not char then return end
-        local root = getCombatRoot(char)
-        local humanoid = char:FindFirstChildOfClass("Humanoid")
-        if not root or not humanoid then return end
-
-        local inCombat = char:GetAttribute("Blocking") == true
-            or char:GetAttribute("CombatAttacking") == true
-            or AutoParry.IsBlocking
-        if not inCombat then
-            if AutoParry.FacingHumanoid == humanoid then
-                restoreParryFacing()
-            end
-            return
-        end
-
-        local nearest, nearestDist = nil, AutoParry.FaceTargetRange
-        local now = os.clock()
-        for attackerName, swingTime in pairs(AutoParry.LastSwing) do
-            if now - swingTime < 3 then
-                local model = getCombatModel(attackerName)
-                if model then
-                    local hrp = getCombatRoot(model)
-                    if hrp then
-                        local d = (hrp.Position - root.Position).Magnitude
-                        if d < nearestDist then
-                            nearest, nearestDist = hrp, d
-                        end
-                    end
-                end
-            else
-                AutoParry.LastSwing[attackerName] = nil
-            end
-        end
-
-        if nearest then
-            if AutoParry.FacingHumanoid ~= humanoid then
-                restoreParryFacing()
-                AutoParry.FacingHumanoid = humanoid
-                AutoParry.PreviousAutoRotate = humanoid.AutoRotate
-            end
-            humanoid.AutoRotate = false
-            local target = Vector3.new(nearest.Position.X, root.Position.Y, nearest.Position.Z)
-            if (target - root.Position).Magnitude > 0.01 then
-                root.CFrame = CFrame.lookAt(root.Position, target)
-            end
-        elseif AutoParry.FacingHumanoid == humanoid then
-            restoreParryFacing()
-        end
-    end)
-end
-
-local function tapParry(attackerName, delay, holdTime, minDelay)
-    local now = os.clock()
-    if now - (AutoParry.LastSwing[attackerName] or 0) < 0.15 then
-        if Dbg.Events then debugLog("[BagahHub SKIP]", attackerName, "cooldown") end
-        return
-    end
-
-    -- Facing Check: skip if attacker isn't facing us
-    if AutoParry.FacingCheckEnabled and not isAttackerFacingMe(attackerName) then
-        if Dbg.Events then debugLog("[BagahHub SKIP]", attackerName, "facing check") end
-        return
-    end
-
-    AutoParry.LastSwing[attackerName] = now
-    local generation = AutoParry.ParryToken
-    local scheduledAt = now
-    local parryDelay = math.max(minDelay or AutoParry.MinParryDelay,
-        delay or (AutoParry.DefaultImpactTime - AutoParry.ImpactLead))
-    if RuntimeProfiler.Enabled then
-        RuntimeProfiler.ParryScheduled += 1
-    end
-    AutoParry.PendingParry[attackerName] = scheduledAt
-    faceAttacker(attackerName)
-
-    if Dbg.Events then
-        debugLog("[BagahHub SCHEDULE]", attackerName, "| delay:", parryDelay,
-            "| hold:", holdTime or AutoParry.ParryDuration,
-            "| mode:", AutoParry.PerfectEnabled and "perfect" or "normal")
-    end
-
-    task.delay(parryDelay, function()
-        if not isAnyAutoParryEnabled() or generation ~= AutoParry.ParryToken
-            or AutoParry.PendingParry[attackerName] ~= scheduledAt then
-            return
-        end
-        AutoParry.PendingParry[attackerName] = nil
-        if RuntimeProfiler.Enabled then
-            RuntimeProfiler.ParryTriggered += 1
-            RuntimeProfiler.ParryTriggeredPlannedTime += parryDelay
-            RuntimeProfiler.ParryActualTime += os.clock() - scheduledAt
-        end
-        faceAttacker(attackerName)
-        local blockToken = holdBlock()
-        AutoParry.TotalParries += 1
-
-        -- Block M1: suppress own M1 until parry resolves
-        if AutoParry.BlockM1Enabled then
-            AutoParry.BlockM1Active = true
-        end
-
-        -- Hold Through Combo: extend hold for fast M1 chains
-        local actualHold = holdTime or AutoParry.ParryDuration
-        if AutoParry.ComboHoldEnabled then
-            local lastSwing = AutoParry.LastSwing[attackerName] or 0
-            local swingGap = now - lastSwing
-            if swingGap < 0.6 then -- fast chain detected
-                actualHold = actualHold + AutoParry.ComboHoldExtra
-            end
-        end
-
-        task.delay(actualHold, function()
-            AutoParry.BlockM1Active = false
-            releaseBlock(blockToken)
-        end)
-    end)
-end
-
--- ── Fallback Safety Block ─────────────────────────────────────────────── --
--- When a real parry can't be scheduled (out of range, facing-check fail,
--- cooldown, etc.) but an attack is incoming, hold block briefly so the
--- character still mitigates damage instead of eating it raw.
-local function fallbackBlock(attackerName, distance, attackerModel)
-    if not AutoParry.FallbackBlockEnabled then return end
-    if not isAnyAutoParryEnabled() then return end
-    -- Don't override an active parry/block window
-    if AutoParry.IsBlocking then return end
-    local now = os.clock()
-    if now - AutoParry.LastFallbackBlock < 0.35 then return end
-    -- Only bother if the attacker is within fallback range
-    distance = distance or getAttackerDistance(attackerName, attackerModel)
-    if distance > AutoParry.FallbackBlockRange then return end
-
-    AutoParry.LastFallbackBlock = now
-    faceAttacker(attackerName)
-    local blockToken = holdBlock()
-    if Dbg.Events then
-        debugLog("[BagahHub FALLBACK]", "safety block", "| attacker:", attackerName,
-            "| hold:", AutoParry.FallbackBlockDuration)
-    end
-    task.delay(AutoParry.FallbackBlockDuration, function()
-        releaseBlock(blockToken)
-    end)
-end
-
-local notify
-
--- ========================================================================= --
---                       PRE-HIT ANIMATION DETECTION                         --
--- ========================================================================= --
-local AnimReg = { Conns = {}, ModelConns = {}, WatchTokens = {}, Attack = {}, Grapple = {} }
-
-local function normalizeAnimationId(animationId)
-    return tostring(animationId or ""):match("%d+") or ""
-end
-
-local function registerAnimation(animation)
-    if not animation:IsA("Animation") then return end
-    local animationId = normalizeAnimationId(animation.AnimationId)
-    if animationId ~= "" then
-        AnimReg.Attack[animationId] = animation:GetFullName()
-    end
-end
-
-local function registerGrappleAnimation(animation)
-    if not animation:IsA("Animation") then return end
-    local animationId = normalizeAnimationId(animation.AnimationId)
-    if animationId ~= "" then
-        AnimReg.Grapple[animationId] = animation:GetFullName()
-    end
-end
-
-local function autoBackdash(attackerName, animationPath)
-    VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.S, false, game)
-    task.wait()
-    VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.Q, false, game)
-    task.wait(0.04)
-    VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Q, false, game)
-    VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.S, false, game)
-    debugLog("[BagahHub GRAPPLE]", "backdash from", attackerName,
-        "| attack:", animationPath)
-end
-
-local function autoPunish(targetName)
-    if not AutoParry.AutoPunishEnabled then return end
-    local now = os.clock()
-    if now - AutoParry.LastAutoPunish < 0.45 then return end
-    AutoParry.LastAutoPunish = now
-
-    task.spawn(function()
-        releaseBlock()
-        if targetName then faceAttacker(targetName) end
-        task.wait(0.14)
-        local camera = workspace.CurrentCamera
-        local viewport = camera and camera.ViewportSize or Vector2.new(800, 600)
-        local inset = GuiService:GetGuiInset()
-        local clickX = math.floor(viewport.X * 0.5)
-        local clickY = math.floor(viewport.Y * 0.5 + inset.Y)
-        VirtualInputManager:SendMouseButtonEvent(clickX, clickY, 0, true, game, 0)
-        task.wait(0.06)
-        VirtualInputManager:SendMouseButtonEvent(clickX, clickY, 0, false, game, 0)
-        if AutoParry.FacingEnabled then
-            task.delay(0.15, restoreParryFacing)
-        end
-        debugLog("[BagahHub PUNISH]", "M1 counter", "| target:", targetName or "unknown")
-    end)
-end
-
-local function buildAttackAnimationRegistry()
-    table.clear(AnimReg.Attack)
-    table.clear(AnimReg.Grapple)
-
-    local roots = {
-        ReplicatedStorage:FindFirstChild("Animations"),
-        ReplicatedStorage:FindFirstChild("AnimationsLEGACY"),
-    }
-    local excludedFolders = {
-        Dodges = true,
-        Grappling = true,
-        PerfectBlockAnims = true,
-    }
-    local excludedNames = {
-        blocking = true,
-        blockhit = true,
-        idle = true,
-        walk = true,
-        parryer = true,
-        parried = true,
-    }
-
-    for _, root in roots do
-        if root then
-            local baseCombat = root:FindFirstChild("BaseCombat")
-            if baseCombat then
-                for _, name in { "1stM1", "2ndM1", "3rdM1", "4thM1", "M2" } do
-                    local animation = baseCombat:FindFirstChild(name)
-                    if animation then
-                        registerAnimation(animation)
-                        if name == "M2" then registerGrappleAnimation(animation) end
-                    end
-                end
-            end
-
-            local combat = root:FindFirstChild("Combat")
-            if combat then
-                for _, animation in combat:GetDescendants() do
-                    local excluded = false
-                    local cursor = animation.Parent
-                    while cursor and cursor ~= combat do
-                        if excludedFolders[cursor.Name] then
-                            excluded = true
-                            break
-                        end
-                        cursor = cursor.Parent
-                    end
-
-                    local lowerName = animation.Name:lower():gsub("[^%w]", "")
-                    local fullPath = animation:GetFullName()
-                    local lowerPath = fullPath:lower()
-                    local isGrappleMove = animation:IsA("Animation")
-                        and (lowerPath:find("grappl", 1, true)
-                            or lowerName == "m2"
-                            or lowerName:find("m2", 1, true))
-                    if isGrappleMove then
-                        registerGrappleAnimation(animation)
-                    end
-                    if animation:IsA("Animation") and not excluded
-                        and not excludedNames[lowerName]
-                        and not lowerName:find("victim", 1, true)
-                        and not lowerName:find("hitreact", 1, true)
-                        and not lowerName:find("ehit", 1, true)
-                        and not lowerName:find("block", 1, true)
-                        and not lowerName:find("dodge", 1, true) then
-                        registerAnimation(animation)
-                    end
-                end
-            end
-        end
-    end
-
-    local registeredCount = 0
-    for _ in AnimReg.Attack do
-        registeredCount += 1
-    end
-    debugLog("[BagahHub REGISTRY]", "Registered attack animations:", registeredCount)
-end
-
-buildAttackAnimationRegistry()
-
-local function disconnectAnimator(model)
-    AnimReg.WatchTokens[model] = nil
-    local connection = AnimReg.Conns[model]
-    if connection then
-        connection:Disconnect()
-        AnimReg.Conns[model] = nil
-    end
-    if CombatModelCache[model.Name] == model then
-        CombatModelCache[model.Name] = nil
-    end
-    CombatRootCache[model] = nil
-end
-
-local function watchCharacter(character)
-    if not character:IsA("Model") or character == LocalPlayer.Character
-        or character.Name == LocalPlayer.Name then
-        return
-    end
-    disconnectAnimator(character)
-    CombatModelCache[character.Name] = character
-    if not isAnyAutoParryEnabled() and not AutoParry.GrappleAwareEnabled then return end
-    local watchToken = {}
-    AnimReg.WatchTokens[character] = watchToken
-
-    task.spawn(function()
-        local humanoid = character:FindFirstChildOfClass("Humanoid")
-            or character:WaitForChild("Humanoid", 10)
-        local animator = humanoid and (humanoid:FindFirstChildOfClass("Animator")
-            or humanoid:WaitForChild("Animator", 10))
-        if not animator or not character.Parent or AnimReg.WatchTokens[character] ~= watchToken then return end
-
-        AnimReg.Conns[character] = animator.AnimationPlayed:Connect(function(track)
-            if RuntimeProfiler.Enabled then RuntimeProfiler.WatchedAnimations += 1 end
-            if not isAnyAutoParryEnabled() and not AutoParry.GrappleAwareEnabled then return end
-            if RuntimeProfiler.Enabled then RuntimeProfiler.AnimationEvents += 1 end
-            local animationId = normalizeAnimationId(track.Animation and track.Animation.AnimationId)
-            if animationId == "" then return end
-            local registryPath = AnimReg.Attack[animationId]
-            local grapplePath = AnimReg.Grapple[animationId]
-            if not registryPath and not grapplePath then return end
-            if RuntimeProfiler.Enabled then RuntimeProfiler.RelevantAnimations += 1 end
-
-            local maxDistance = AutoParry.PerfectEnabled
-                and PERFECT_PARRY_CONFIG.MaxDistance or AutoParry.MaxDistance
-            local distance = getAttackerDistance(character.Name, character)
-            if distance > maxDistance then
-                fallbackBlock(character.Name, distance, character)
-                return
-            end
-            if character:GetAttribute("CanFight") == false or character:GetAttribute("Ragdoll") == true then return end
-
-            if Dbg.Events then
-                debugLog("[BagahHub ANIMATION]", character.Name, "| name:", track.Name,
-                    "| id:", animationId, "| priority:", track.Priority.Name,
-                    "| attack:", registryPath or false, "| grapple:", grapplePath or false)
-            end
-
-            if AutoParry.GrappleAwareEnabled and grapplePath then
-                AutoParry.PendingParry[character.Name] = nil
-                local now = os.clock()
-                if now - AutoParry.LastGrappleDodge >= 0.75 then
-                    AutoParry.LastGrappleDodge = now
-                    task.spawn(autoBackdash, character.Name, grapplePath)
-                end
-                return
-            end
-
-            if not registryPath then return end
-
-            local candidates = AutoParry.RecentAttackAnimations[character.Name]
-            if not candidates then
-                candidates = {}
-                AutoParry.RecentAttackAnimations[character.Name] = candidates
-            end
-
-            local attackStartedAt = os.clock()
-            table.insert(candidates, {
-                Id = animationId,
-                StartedAt = attackStartedAt,
-                Name = track.Name,
-                Track = track,
-            })
-
-            while #candidates > 8 do
-                table.remove(candidates, 1)
-            end
-
-            if AutoParry.PerfectEnabled then
-                local function schedulePerfect(correction, syncValid)
-                    if not AutoParry.PerfectEnabled or not character.Parent then return end
-                    local impactTime = AutoParry.LearnedImpactTime[animationId]
-                        or getPerfectDefaultImpactTime(registryPath)
-                    local parryDelay = impactTime - PERFECT_PARRY_CONFIG.InputLead
-                        - MOBILE_EXTRA_LEAD - getNetworkOneWayTime() - correction
-                    if Dbg.Events then
-                        debugLog("[BagahHub SYNC]", animationId,
-                            "| enabled:", AutoParry.AnimationSyncEnabled,
-                            "| correction:", correction,
-                            "| animationValid:", syncValid,
-                            "| timePosition:", track.TimePosition,
-                            "| speed:", track.Speed,
-                            "| delay:", math.max(PERFECT_PARRY_CONFIG.MinDelay, parryDelay))
-                    end
-                    tapParry(character.Name, parryDelay,
-                        PERFECT_PARRY_CONFIG.HoldTime, PERFECT_PARRY_CONFIG.MinDelay)
-                end
-
-                if AutoParry.AnimationSyncEnabled then
-                    -- Read TimePosition immediately (no Heartbeat:Wait, saves 1 frame on mobile)
-                    local elapsed = os.clock() - attackStartedAt
-                    local syncCorrection, syncValid = getAnimationSyncCorrection(track)
-                    schedulePerfect(syncValid and syncCorrection or elapsed, syncValid)
-                else
-                    schedulePerfect(0, false)
-                end
-            else
-                local impactTime = AutoParry.LearnedImpactTime[animationId]
-                    or AutoParry.DefaultImpactTime
-                local parryDelay = math.max(AutoParry.MinParryDelay,
-                    impactTime - AutoParry.ImpactLead - MOBILE_EXTRA_LEAD)
-                tapParry(character.Name, parryDelay)
-            end
-        end)
-    end)
-end
-
-local function watchContainer(container)
-    if not container then return end
-    for _, character in container:GetChildren() do
-        watchCharacter(character)
-    end
-    AnimReg.ModelConns[container] = container.ChildAdded:Connect(watchCharacter)
-    container.ChildRemoved:Connect(disconnectAnimator)
-end
-
-local function refreshAnimationWatchers()
-    if isAnyAutoParryEnabled() or AutoParry.GrappleAwareEnabled then
-        for _, containerName in ipairs({ "Players", "NPCs" }) do
-            local container = workspace:FindFirstChild(containerName)
-            if container then
-                for _, character in container:GetChildren() do
-                    watchCharacter(character)
-                end
-            end
-        end
-        return
-    end
-
-    local models = {}
-    for model in pairs(AnimReg.Conns) do table.insert(models, model) end
-    for _, model in ipairs(models) do disconnectAnimator(model) end
-end
-
-watchContainer(workspace:WaitForChild("Players", 10))
-watchContainer(workspace:WaitForChild("NPCs", 10))
-
--- Start default combat detection before loading the UI so early attacks are not missed.
-AutoParry.PerfectEnabled = true
-AutoParry.AnimationSyncEnabled = true
-AutoParry.FacingEnabled = true
-refreshAnimationWatchers()
-
-for _, player in Players:GetPlayers() do
-    if player ~= LocalPlayer and player.Character then watchCharacter(player.Character) end
-end
-Players.PlayerAdded:Connect(function(player)
-    if player ~= LocalPlayer then player.CharacterAdded:Connect(watchCharacter) end
-end)
-
--- ========================================================================= --
---                          INCOMING ATTACK DETECTION                         --
--- ========================================================================= --
-
-CombatClientRemote.OnClientEvent:Connect(function(eventType, ...)
-    if RuntimeProfiler.Enabled then RuntimeProfiler.CombatEvents += 1 end
-    if not isAnyAutoParryEnabled() then return end
-
-    if eventType == "NpcCombatSound" then
-        local attacker, action = ...
-
-        if action == "PunchSwing" and attacker ~= LocalPlayer.Name then
-            local attackerModel = getCombatModel(attacker)
-            local distance = getAttackerDistance(attacker, attackerModel)
-            local maxDistance = AutoParry.PerfectEnabled
-                and PERFECT_PARRY_CONFIG.MaxDistance or AutoParry.MaxDistance
-            if distance > maxDistance then
-                fallbackBlock(attacker, distance, attackerModel)
-                return
-            end
-
-            if Dbg.Events then
-                debugLog("[BagahHub EVENT]", eventType, "| attacker:", attacker, "| action:", action, "| dist:", distance)
-            end
-
-            local now = os.clock()
-            local candidates = AutoParry.RecentAttackAnimations[attacker]
-            local recent
-
-            if candidates then
-                for index = #candidates, 1, -1 do
-                    local candidate = candidates[index]
-                    local age = now - candidate.StartedAt
-                    if age > 2 then
-                        table.remove(candidates, index)
-                    elseif not recent and age >= 0.05 then
-                        recent = candidate
-                    end
-                end
-            end
-
-            if recent then
-                local impactTime = now - recent.StartedAt
-                if impactTime > 0.05 and impactTime < 2 then
-                    local previousImpact = AutoParry.LearnedImpactTime[recent.Id]
-                    local learnedImpact = previousImpact
-                        and (previousImpact * 0.75 + impactTime * 0.25)
-                        or impactTime
-                    AutoParry.LearnedImpactTime[recent.Id] = learnedImpact
-                    if Dbg.Events then
-                        debugLog("[BagahHub LEARNED]", recent.Id, "| sample:", impactTime,
-                            "| smoothed impact:", learnedImpact)
-                    end
-                end
-            end
-        end
-
-
-        if action == "PerfectBlocked" and attacker == LocalPlayer.Name then
-            local now = os.clock()
-            local isNewResult = now - AutoParry.LastPerfectResult >= 0.15
-            if isNewResult then
-                AutoParry.TotalPerfectBlocks += 1
-                AutoParry.LastPerfectResult = now
-            end
-            local recentTarget
-            local recentTime = -math.huge
-            for targetName, swingTime in pairs(AutoParry.LastSwing) do
-                if swingTime > recentTime then
-                    recentTime = swingTime
-                    recentTarget = targetName
-                end
-            end
-            autoPunish(recentTarget)
-            if Dbg.Events then
-                debugLog("[BagahHub RESULT]", "PERFECT PARRY (Sound)")
-            end
-            if isNewResult and AutoParry.Notification then
-                notify("✨ Perfect Parry!", "Perfect block!", 1.5)
-            end
-        end
-
-
-        if (action == "Blocked" or action == "BlockedAHit")
-            and attacker == LocalPlayer.Name then
-            local now = os.clock()
-            if now - AutoParry.LastBlockResult >= 0.15 then
-                AutoParry.TotalBlocks += 1
-                AutoParry.LastBlockResult = now
-            end
-            if Dbg.Events then
-                debugLog("[BagahHub RESULT]", "BLOCKED (Sound)")
-            end
-        end
-
-
-        if action == "PunchHit" and attacker ~= LocalPlayer.Name then
-            if Dbg.Events then
-                debugLog("[BagahHub RESULT]", "HIT by", attacker)
-            end
-        end
-    end
-
-
-    if eventType == "CombatPairCosmetic" then
-        local action, attacker, victim = ...
-
-        if (action == "M1PerfectBlocked" or action == "M2PerfectBlocked")
-            and victim == LocalPlayer.Name then
-            local now = os.clock()
-            local isNewResult = now - AutoParry.LastPerfectResult >= 0.15
-            if isNewResult then
-                AutoParry.TotalPerfectBlocks += 1
-                AutoParry.LastPerfectResult = now
-            end
-            autoPunish(attacker)
-            if Dbg.Events then
-                debugLog("[BagahHub RESULT]", "PERFECT PARRY | attacker:", attacker,
-                    "| victim:", victim)
-            end
-            if isNewResult and AutoParry.Notification then
-                notify("✨ Perfect Parry!", "Blocked " .. tostring(victim), 1.5)
-            end
-        end
-
-        if (action == "M1Blocked" or action == "M2Blocked")
-            and victim == LocalPlayer.Name then
-            local now = os.clock()
-            if now - AutoParry.LastBlockResult >= 0.15 then
-                AutoParry.TotalBlocks += 1
-                AutoParry.LastBlockResult = now
-            end
-            if Dbg.Events then
-                debugLog("[BagahHub RESULT]", "BLOCKED | attacker:", attacker, "| victim:", victim)
-            end
-        end
-    end
-end)
-
--- ========================================================================= --
---                         CHARACTER RESET HANDLING                           --
--- ========================================================================= --
-LocalPlayer.CharacterAdded:Connect(function(_character)
-    AutoParry.ParryToken += 1
-    AutoParry.IsBlocking = false
-    AutoParry.BlockToken += 1
-    AutoParry.LastPerfectResult = 0
-    AutoParry.LastBlockResult = 0
-    AutoParry.LastSwing = {}
-    AutoParry.PendingParry = {}
-    AutoParry.RecentAttackAnimations = {}
-    AutoParry.LastGrappleDodge = 0
-    AutoParry.LastAutoPunish = 0
-    AutoParry.FacingHumanoid = nil
-    AutoParry.PreviousAutoRotate = nil
-end)
-
--- ========================================================================= --
+-- Obsidian UI adapter: retains the existing Evade control calls.
 local Library = loadstring(game:HttpGet(
     "https://raw.githubusercontent.com/deividcomsono/Obsidian/refs/heads/main/Library.lua"))()
 local SaveManager = loadstring(game:HttpGet(
     "https://raw.githubusercontent.com/deividcomsono/Obsidian/refs/heads/main/addons/SaveManager.lua"))()
 Library.ForceCheckbox = false
 Library.ShowToggleFrameInKeybinds = true
+Library.Scheme.AccentColor = Color3.fromRGB(250, 204, 21)
 
 local ObsidianWindow = Library:CreateWindow({
-    Title = "Bagah Hub - Gakuran",
-    Footer = "Bagah Project | v0.0.2",
+    Title = "Bagah Hub - Evade",
+    Footer = "Bagah Projects | Evade v1.8.2",
     NotifySide = "Right",
     ShowCustomCursor = false,
 })
@@ -1176,28 +20,6 @@ local function nextControlIndex(prefix)
     return prefix .. controlIndex
 end
 
-local function getEspHealthDebugOutput()
-    return table.concat({
-        "BagahHub ESP Health Debug",
-        "Copied: " .. os.date("!%Y-%m-%dT%H:%M:%SZ"),
-        "--- TIMELINE ---",
-        table.concat(EspHealthDebug.Timeline, "\n"),
-    }, "\n")
-end
-
-local function getHudHealthDebugOutput()
-    return table.concat({
-        "BagahHub Player HUD Health Debug",
-        "Copied: " .. os.date("!%Y-%m-%dT%H:%M:%SZ"),
-        "--- TIMELINE ---",
-        table.concat(HudHealthDebug.Timeline, "\n"),
-    }, "\n")
-end
-
-local function titledControlIndex(prefix, title)
-    return prefix .. tostring(title):gsub("[^%w]", "")
-end
-
 local function sliderRounding(step)
     local decimal = tostring(step or 1):match("%.(%d+)")
     return decimal and #decimal or 0
@@ -1206,11 +28,8 @@ end
 local function createAdapterTab(info)
     local rawTab = ObsidianWindow:AddTab(info.Title, info.Icon)
     local adapter = { Raw = rawTab, Group = nil, Left = true }
-
     local function ensureGroup()
-        if not adapter.Group then
-            adapter.Group = rawTab:AddLeftGroupbox("General")
-        end
+        if not adapter.Group then adapter.Group = rawTab:AddLeftGroupbox("General") end
         return adapter.Group
     end
 
@@ -1220,28 +39,29 @@ local function createAdapterTab(info)
         self.Left = not self.Left
     end
 
-    function adapter:Divider()
-        ensureGroup():AddDivider()
-    end
+    function adapter:Divider() ensureGroup():AddDivider() end
+
+    function adapter:Space() ensureGroup():AddDivider() end
 
     function adapter:Toggle(options)
-        return ensureGroup():AddToggle(options.Flag or titledControlIndex("Toggle", options.Title), {
+        local raw = ensureGroup():AddToggle(options.Flag or nextControlIndex("Toggle"), {
             Text = options.Title,
-            Tooltip = options.Description or options.Desc,
-            Default = options.Default or false,
+            Tooltip = options.Desc or options.Description,
+            Default = options.Value ~= nil and options.Value or options.Default or false,
             Callback = options.Callback,
         })
+        return { Set = function(_, value) raw:SetValue(value) end }
     end
 
     function adapter:Slider(options)
         local value = options.Value or {}
         return ensureGroup():AddSlider(options.Flag or nextControlIndex("Slider"), {
             Text = options.Title,
-            Tooltip = options.Description or options.Desc,
+            Tooltip = options.Desc or options.Description,
             Default = value.Default or value.Min or 0,
             Min = value.Min or 0,
             Max = value.Max or 100,
-            Rounding = sliderRounding(options.Step),
+            Rounding = sliderRounding(options.Step or value.Step),
             Callback = options.Callback,
         })
     end
@@ -1249,61 +69,135 @@ local function createAdapterTab(info)
     function adapter:Dropdown(options)
         local raw = ensureGroup():AddDropdown(options.Flag or nextControlIndex("Dropdown"), {
             Text = options.Title,
-            Tooltip = options.Description or options.Desc,
+            Tooltip = options.Desc or options.Description,
             Values = options.Values or {},
             Default = options.Value,
             Multi = false,
-            Searchable = true,
+            Searchable = options.SearchBarEnabled ~= false,
             Callback = options.Callback,
         })
         return {
-            Refresh = function(_, values) raw:SetValues(values) end,
+            Refresh = function(_, values, value)
+                raw:SetValues(values); if value then raw:SetValue(value) end
+            end,
             Select = function(_, value) raw:SetValue(value) end,
         }
     end
 
+    function adapter:Input(options)
+        local raw = ensureGroup():AddInput(options.Flag or nextControlIndex("Input"), {
+            Text = options.Title,
+            Tooltip = options.Desc or options.Description,
+            Default = options.Value or options.Default or "",
+            Placeholder = options.Placeholder,
+            Numeric = options.Numeric or false,
+            Finished = options.Finished == true,
+            Callback = options.Callback,
+        })
+        return { Set = function(_, value) raw:SetValue(value) end }
+    end
+
     function adapter:Button(options)
         return ensureGroup():AddButton({
-            Text = options.Title,
-            Tooltip = options.Description or options.Desc,
-            Func = options.Callback,
+            Text = options.Title, Tooltip = options.Desc or options.Description, Func = options.Callback,
         })
     end
 
     function adapter:Paragraph(options)
-        return ensureGroup():AddLabel((options.Title or "") .. "\n" .. (options.Desc or options.Description or ""), true)
+        local title = options.Title or ""
+        local raw = ensureGroup():AddLabel(title .. "\n" .. (options.Desc or options.Description or ""), true)
+        return { SetDesc = function(_, value) raw:SetText(title .. "\n" .. value) end }
     end
 
     return adapter
 end
 
 local Window = {
-    Tab = function(_, info) return createAdapterTab(info) end,
-    Tag = function() end,
-    SelectTab = function() end,
-    SetToggleKey = function(_, key)
+    Tabs = {},
+    Tab = function(self, info)
+        local tab = createAdapterTab(info)
+        table.insert(self.Tabs, tab)
+        return tab
+    end,
+    SelectTab = function(self, index)
+        local tab = self.Tabs[index]
+        if tab and tab.Raw and tab.Raw.Show then tab.Raw:Show() end
+    end,
+}
+function Window:SetToggleKey(key)
+    local picker = Library.Options.EvadeMenuKeybind
+    if not picker then
         local tab = ObsidianWindow:AddTab("UI Settings", "settings")
         local group = tab:AddLeftGroupbox("Menu")
-        group:AddLabel("Menu Keybind"):AddKeyPicker("BagahMenuKeybind", {
+        group:AddLabel("Menu Keybind"):AddKeyPicker("EvadeMenuKeybind", {
             Default = key.Name,
             NoUI = true,
             Text = "Menu Keybind",
         })
-        Library.ToggleKeybind = Library.Options.BagahMenuKeybind
-    end,
-}
+        picker = Library.Options.EvadeMenuKeybind
+        Library.ToggleKeybind = picker
+    else
+        picker:SetValue(key.Name)
+    end
+end
+
+SaveManager:SetLibrary(Library)
+SaveManager:IgnoreThemeSettings()
+SaveManager:SetFolder("BagahHubEvade")
+SaveManager:SetSubFolder("Evade-" .. tostring(game.PlaceId))
 
 local ObsidianUI = {
+    TransparencyValue = 0,
     Notify = function(_, options)
         Library:Notify({
             Title = options.Title or "Bagah Hub",
-            Description = options.Content or options.Description or "",
-            Time = options.Duration or 2,
+            Description = options.Content or "",
+            Time = options
+                .Duration or 2
         })
     end,
 }
 
-Window:SetToggleKey(Enum.KeyCode.RightControl)
+-- Keybind Configuration
+local keybindFile = "BagahHub_Evade_Keybind.txt"
+
+local function loadKeybind()
+    if isfile(keybindFile) then
+        local savedKey = readfile(keybindFile)
+        for _, key in pairs(Enum.KeyCode:GetEnumItems()) do
+            if tostring(key) == savedKey then
+                return key
+            end
+        end
+    end
+    return Enum.KeyCode.RightControl
+end
+
+local initialKey = loadKeybind()
+Window:SetToggleKey(initialKey)
+
+-- -------------------------------------------------------------------------- --
+--                                  Services                                  --
+-- -------------------------------------------------------------------------- --
+local RunService         = game:GetService("RunService")
+local Players            = game:GetService("Players")
+local player             = Players.LocalPlayer
+local PlayerGui          = player:WaitForChild("PlayerGui")
+local UserInputService   = game:GetService("UserInputService")
+local TeleportService    = game:GetService("TeleportService")
+local HttpService        = game:GetService("HttpService")
+local ReplicatedStorage  = game:GetService("ReplicatedStorage")
+local InsertService      = game:GetService("InsertService")
+local TweenService       = game:GetService("TweenService")
+local MarketplaceService = game:GetService("MarketplaceService")
+local VirtualUser        = game:GetService("VirtualUser")
+local placeId            = game.PlaceId
+local jobId              = game.JobId
+local ServerStateRegistryService
+pcall(function()
+    ServerStateRegistryService = require(ReplicatedStorage:WaitForChild("Services"):WaitForChild("Data")
+        :WaitForChild("ServerStateRegistryService"))
+end)
 
 -- -------------------------------------------------------------------------- --
 --                            NOTIFICATION FUNCTION                           --
@@ -1346,1869 +240,3516 @@ local function Warning(title, message, duration)
 end
 
 
--- ========================================================================= --
---                         PLAYER TAB / RHYTHM PLAYER                       --
--- ========================================================================= --
-local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
-local Rhythm    = {
-    Enabled = false,
-    Root = nil,
-    Active = {},
-    Holds = {},
-    Tokens = {},
-    Keys = { Enum.KeyCode.X, Enum.KeyCode.C, Enum.KeyCode.N, Enum.KeyCode.M },
-    Names = { "X", "C", "N", "M" },
-    Receptors = {},
-    LaneCount = 4,
-    LastPress = {},
-    HitWindow = UserInputService.TouchEnabled and 0.12 or 0.08,
-    MinInterval = 0.015,
-    NoteTravelTime = 2.5,
-    TouchLeadTime = 0.035, -- virtual touch reaches the game roughly 30-45ms after SendTouchEvent
-    Generation = 0,
-    TouchMode = UserInputService.TouchEnabled,
-    TouchPositions = {},
-    TouchCorrection = nil,
-    PendingTouches = {},
-    -- ── Timing mode settings ──────────────────────────────────────────
-    Mode = "perfect",   -- "perfect" | "custom"
-    PressLeadMs = 0,    -- extra ms to press early (default 0)
-    TwoLaneLeadMs = 12, -- 2-lane drum layout needs a small earlier input lead
-    HoldExtendMs = 80,  -- extra ms to hold long notes (default 80)
-    PerfectChance = 70, -- % chance of PERFECT in custom mode
-    GoodChance = 25,    -- % chance of GOOD in custom mode
-    OkChance = 5,       -- % chance of OK in custom mode
-    -- ── Debug ─────────────────────────────────────────────────────────
-    DebugEnabled = false,
-    DebugTimeline = {},
-    DebugStartedAt = os.clock(),
-    LastMissingRootDebug = 0,
-    -- ── Internal state (moved from locals to save upvalue slots) ─────
-    BuildId = "rhythm-notetime-20260802-6",
-    Connections = {},
-    ManualTouchStarted = {},
-    DebugRootReported = nil,
-    TaskDelayComp = 0.016,
-    RenderConn = nil,
-    LastScan = 0,
-    ScanInterval = 0.5,
-    -- ── Rating Spy ──────────────────────────────────────────────────
-    RatingSpy = false,
-    RatingConn = nil,
-    RatingRemoveConn = nil,
-    RatingTextConns = {},
-    RatingCounts = {},
-    RatingTotal = 0,
-    LastPressAt = {},
-    GuiInspector = false,
-    InspectorConnections = {},
-    InspectorRoot = nil,
-    InspectorIds = setmetatable({}, { __mode = "k" }),
-    NextInspectorId = 0,
-    ClockEvidence = {},
-    -- ── Attribute-based timing (NoteTime / NoteLane) ────────────────
-    ScrollSpeed = nil,
-    ScrollSpeedSamples = {},
-    SongTime = nil,
-    SongTimeSamples = {},
-    LastSongTimeAt = 0,
-}
-
-local function rhythmDebug(tag, ...)
-    if not Rhythm.DebugEnabled then return end
-    local values = { ... }
-    for index, value in ipairs(values) do values[index] = tostring(value) end
-    local line = string.format("+%.4f | [RHYTHM %s] %s",
-        os.clock() - Rhythm.DebugStartedAt, tag, table.concat(values, " "))
-    table.insert(Rhythm.DebugTimeline, line)
-    if #Rhythm.DebugTimeline > 800 then table.remove(Rhythm.DebugTimeline, 1) end
-end
-
-local function makeRhythmDebugReport()
-    local count = 0
-    for _ in pairs(Rhythm.Active) do count += 1 end
-    return table.concat({
-        "BagahHub Gakuran Rhythm Debug",
-        "Build: " .. Rhythm.BuildId,
-        "Copied: " .. os.date("!%Y-%m-%dT%H:%M:%SZ"),
-        "TouchEnabled: " .. tostring(UserInputService.TouchEnabled),
-        "KeyboardEnabled: " .. tostring(UserInputService.KeyboardEnabled),
-        "TouchMode: " .. tostring(Rhythm.TouchMode),
-        "Enabled: " .. tostring(Rhythm.Enabled),
-        "Root: " .. tostring(Rhythm.Root),
-        "LaneCount: " .. tostring(Rhythm.LaneCount),
-        "TrackedNotes: " .. tostring(count),
-        "ScrollSpeed: " .. tostring(Rhythm.ScrollSpeed),
-        "SongTime: " .. tostring(Rhythm.SongTime),
-        "--- RATING SPY ---",
-        "RatingSpy: " .. tostring(Rhythm.RatingSpy),
-        "Total: " .. tostring(Rhythm.RatingTotal),
-        "Perfect: " .. tostring(Rhythm.RatingCounts["Perfect"] or 0),
-        "Great: " .. tostring(Rhythm.RatingCounts["Great"] or 0),
-        "Good: " .. tostring(Rhythm.RatingCounts["Good"] or 0),
-        "Ok: " .. tostring(Rhythm.RatingCounts["Ok"] or 0),
-        "Bad: " .. tostring(Rhythm.RatingCounts["Bad"] or 0),
-        "Miss: " .. tostring(Rhythm.RatingCounts["Miss"] or 0),
-        "--- CLOCK EVIDENCE ---",
-        #Rhythm.ClockEvidence > 0 and table.concat(Rhythm.ClockEvidence, "\n") or "No clock candidates captured",
-        "--- TIMELINE ---",
-        table.concat(Rhythm.DebugTimeline, "\n"),
-    }, "\n")
-end
-
-local function copyRhythmDebug()
-    local output = makeRhythmDebugReport()
-    if typeof(setclipboard) == "function" then
-        setclipboard(output)
-        print("[BagahHub RHYTHM] Debug copied to clipboard")
-    else
-        warn("[BagahHub RHYTHM] setclipboard unavailable; copy console output")
-        print(output)
-    end
-end
-
--- ========================================================================= --
---                             DEBUG COPY UTILITY                              --
--- ========================================================================= --
-
--- ── Upload debug logs to a free paste service (paste.rs) ──────────────── --
--- Uses the executor's HTTP function. Prints the paste URL + copies to clipboard.
-local function uploadDebugLogs(text)
-    -- Safely resolve whichever HTTP function the executor exposes
-    local env = getfenv and getfenv() or _G
-    local httpFn = (typeof(request) == "function" and request)
-        or (typeof(http_request) == "function" and http_request)
-        or (typeof(syn) == "table" and syn.request)
-        or (rawget(env, "http") and rawget(env, "http").request)
-
-    if not httpFn then
-        warn("[BagahHub UPLOAD] No executor HTTP function available (request/http_request)")
-        return
-    end
-
-    print("[BagahHub UPLOAD] Uploading debug logs to paste.rs ...")
-
-    task.spawn(function()
-        local ok, res = pcall(function()
-            return httpFn({
-                Url = "https://paste.rs/",
-                Method = "POST",
-                Headers = { ["Content-Type"] = "text/plain" },
-                Body = text,
-            })
-        end)
-
-        if not ok or not res then
-            warn("[BagahHub UPLOAD] Upload failed:", res or "no response")
-            return
-        end
-
-        local body = res.Body or ""
-        if res.StatusCode == 200 or res.StatusCode == 201 then
-            local url = body:match("https?://%S+") or body
-            print("[BagahHub UPLOAD] ✅ Debug log uploaded:", url)
-            if typeof(setclipboard) == "function" then
-                setclipboard(url)
-                print("[BagahHub UPLOAD] URL copied to clipboard")
-            end
-            if notify then notify("📤 Debug Uploaded", url, 6) end
-        else
-            warn("[BagahHub UPLOAD] Server returned", res.StatusCode, body)
-        end
-    end)
-end
-
-local function copyActiveDebugLogs()
-    local reports = {}
-    if Dbg.Events then
-        table.insert(reports, getAutoParryDebugOutput())
-    end
-    if Dbg.StunEvents then
-        table.insert(reports, getStunDebugOutput())
-    end
-    if Rhythm.DebugEnabled then
-        table.insert(reports, makeRhythmDebugReport())
-    end
-    if EspHealthDebug.Enabled then
-        table.insert(reports, getEspHealthDebugOutput())
-    end
-    if HudHealthDebug.Enabled then
-        table.insert(reports, getHudHealthDebugOutput())
-    end
-
-    if #reports == 0 then
-        warn("[BagahHub] Enable a debug logger before pressing F8")
-        return
-    end
-
-    local output = table.concat(reports, "\n\n========================================\n\n")
-
-    if typeof(setclipboard) == "function" then
-        setclipboard(output)
-        print("[BagahHub DEBUG COPY]", #reports, "active debug report(s) copied with F8")
-    else
-        warn("[BagahHub] Executor does not provide setclipboard")
-    end
-
-    uploadDebugLogs(output)
-end
-
-UserInputService.InputBegan:Connect(function(input, gameProcessed)
-    if not gameProcessed and input.KeyCode == Dbg.CopyKey then
-        copyActiveDebugLogs()
-    end
-    -- Track manual rhythm key presses for rating delta calculation
-    if Rhythm.RatingSpy and input.UserInputType == Enum.UserInputType.Keyboard then
-        for lane, key in ipairs(Rhythm.Keys) do
-            if input.KeyCode == key then
-                Rhythm.LastPressAt[lane] = os.clock()
-                break
-            end
-        end
-    end
-end)
-
-UserInputService.InputBegan:Connect(function(input, processed)
-    if input.UserInputType ~= Enum.UserInputType.Touch then return end
-    local now = os.clock()
-    if not Rhythm.TouchCorrection then
-        for lane, pending in pairs(Rhythm.PendingTouches) do
-            if now - pending.Time <= 0.25
-                and math.abs(input.Position.X - pending.Target.X) <= 80 then
-                Rhythm.TouchCorrection = pending.Sent - Vector2.new(
-                    input.Position.X, input.Position.Y)
-                table.clear(Rhythm.PendingTouches)
-                rhythmDebug("TOUCH CALIBRATED", "lane=", lane,
-                    "target=", pending.Target, "observed=", input.Position,
-                    "correction=", Rhythm.TouchCorrection)
-                break
-            elseif now - pending.Time > 0.25 then
-                Rhythm.PendingTouches[lane] = nil
-            end
-        end
-    end
-
-    if not Rhythm.DebugEnabled then return end
-    Rhythm.ManualTouchStarted[input] = input.Position
-    rhythmDebug("REAL TOUCH BEGIN", "pos=", input.Position,
-        "processed=", processed, "state=", input.UserInputState)
-end)
-
-UserInputService.InputEnded:Connect(function(input, processed)
-    if not Rhythm.DebugEnabled or input.UserInputType ~= Enum.UserInputType.Touch then return end
-    rhythmDebug("REAL TOUCH END", "start=", Rhythm.ManualTouchStarted[input] or "unknown",
-        "pos=", input.Position, "processed=", processed,
-        "state=", input.UserInputState)
-    Rhythm.ManualTouchStarted[input] = nil
-end)
-
-UserInputService.TouchTap:Connect(function(positions, processed)
-    if not Rhythm.DebugEnabled then return end
-    local values = {}
-    for index, position in ipairs(positions) do values[index] = tostring(position) end
-    rhythmDebug("REAL TOUCH TAP", "positions=", table.concat(values, ";"),
-        "processed=", processed)
-end)
--- ========================================================================= --
---                     INFINITE STAMINA + NO DODGE COOLDOWN                   --
--- ========================================================================= --
-local CS                   = {
-    InfiniteStamina = false,
-    NoDodgeCooldown = false,
-    AntiStun = false,
-    AntiRagdoll = false,
-    DodgeCooldownTime = 0,
-    LastDodgeTime = 0,
-    NamecallHooked = false,
-    OldNamecall = nil,
-    AntiStunConns = {},
-    StunDebugConns = {},
-}
-
-local dodgeGateSpoof       = {
-    OutnumberedEvasiveGrant = true,
-    IFRAMECD                = nil,
-    Ragdoll                 = nil,
-    Blocking                = nil,
-    CombatAttacking         = nil,
-    Greenzone               = nil,
-    RpCombatLocked          = nil,
-    Downed                  = nil,
-    Stunned                 = nil,
-    GuardBroken             = nil,
-    Grappling               = nil,
-    CantAnything            = nil,
-    CombatRecovery          = nil,
-}
-
-local dodgeBlockedSetAttrs = {
-    IFRAMECD                 = true,
-    EvasiveCooldownRemaining = true,
-    CantAnything             = true,
-}
-
-local stunAttrs            = {
-    Stunned        = true,
-    GuardBroken    = true,
-    CombatRecovery = true,
-}
-
-local ragdollAttrs         = {
-    Ragdoll = true,
-    Downed  = true,
-}
-
-
-local stunAnimationIds = {
-    ["91352556581859"]  = true, -- heavy/M2 reaction (1.25 s)
-    ["108045962864902"] = true, -- short hit reaction
-    ["122541287927198"] = true, -- short hit reaction
-    ["104407197874289"] = true, -- short hit reaction
-}
-
-local function disconnectAntiStunConnections()
-    for _, connection in ipairs(CS.AntiStunConns) do
-        connection:Disconnect()
-    end
-    table.clear(CS.AntiStunConns)
-end
-
-local function disconnectStunDebugConnections()
-    for _, connection in ipairs(CS.StunDebugConns) do
-        connection:Disconnect()
-    end
-    table.clear(CS.StunDebugConns)
-end
-
-local function attachStunDebug(character)
-    disconnectStunDebugConnections()
-    if not Dbg.StunEvents or not character then return end
-
-    local humanoid = character:FindFirstChildOfClass("Humanoid")
-        or character:WaitForChild("Humanoid", 10)
-    if not humanoid then
-        stunDebugLog("ERROR", "Humanoid not found")
-        return
-    end
-
-    stunDebugLog("ATTACH", character, "attributes=", character:GetAttributes(),
-        "state=", humanoid:GetState(), "walkSpeed=", humanoid.WalkSpeed,
-        "jumpPower=", humanoid.JumpPower, "platformStand=", humanoid.PlatformStand)
-
-    table.insert(CS.StunDebugConns, character.AttributeChanged:Connect(function(attribute)
-        stunDebugLog("ATTRIBUTE", attribute, "=", character:GetAttribute(attribute),
-            "all=", character:GetAttributes())
-    end))
-    table.insert(CS.StunDebugConns, humanoid.StateChanged:Connect(function(oldState, newState)
-        stunDebugLog("HUMANOID STATE", oldState, "->", newState,
-            "walkSpeed=", humanoid.WalkSpeed, "platformStand=", humanoid.PlatformStand)
-    end))
-    table.insert(CS.StunDebugConns, humanoid:GetPropertyChangedSignal("WalkSpeed"):Connect(function()
-        stunDebugLog("PROPERTY", "WalkSpeed=", humanoid.WalkSpeed)
-    end))
-    table.insert(CS.StunDebugConns, humanoid:GetPropertyChangedSignal("PlatformStand"):Connect(function()
-        stunDebugLog("PROPERTY", "PlatformStand=", humanoid.PlatformStand)
-    end))
-
-    local animator = humanoid:FindFirstChildOfClass("Animator")
-        or humanoid:WaitForChild("Animator", 5)
-    if animator then
-        table.insert(CS.StunDebugConns, animator.AnimationPlayed:Connect(function(track)
-            local animation = track.Animation
-            stunDebugLog("ANIMATION", "name=", animation and animation.Name or track.Name,
-                "id=", animation and animation.AnimationId or "none",
-                "priority=", track.Priority, "length=", track.Length)
-            table.insert(CS.StunDebugConns, track.Stopped:Connect(function()
-                stunDebugLog("ANIMATION STOP", "name=", animation and animation.Name or track.Name,
-                    "id=", animation and animation.AnimationId or "none")
-            end))
-        end))
-    end
-end
-
-local function getRecoveryAnimationType(track)
-    local animation = track.Animation
-    local name = string.lower((animation and animation.Name) or track.Name or "")
-    local animationId = animation and animation.AnimationId or ""
-    local numericId = string.match(animationId, "%d+")
-    if numericId and stunAnimationIds[numericId] then
-        return "stun"
-    end
-    if string.find(name, "ragdoll", 1, true)
-        or string.find(name, "getup", 1, true)
-        or string.find(name, "knock", 1, true)
-        or string.find(name, "downed", 1, true) then
-        return "ragdoll"
-    end
-    if string.find(name, "stun", 1, true)
-        or string.find(name, "recover", 1, true)
-        or string.find(name, "guardbreak", 1, true) then
-        return "stun"
-    end
-    return nil
-end
-
-local function cancelRecovery(character, humanoid)
-    if not (CS.AntiStun or CS.AntiRagdoll) or not character or not humanoid then return end
-
-    if CS.AntiRagdoll then
-        humanoid.PlatformStand = false
-        humanoid.Sit = false
-        humanoid.AutoRotate = true
-        humanoid:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
-        humanoid:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
-        humanoid:SetStateEnabled(Enum.HumanoidStateType.GettingUp, false)
-
-        local state = humanoid:GetState()
-        if state == Enum.HumanoidStateType.Ragdoll
-            or state == Enum.HumanoidStateType.FallingDown
-            or state == Enum.HumanoidStateType.GettingUp
-            or state == Enum.HumanoidStateType.PlatformStanding then
-            humanoid:ChangeState(Enum.HumanoidStateType.Running)
-        end
-    end
-
-    local animator = humanoid:FindFirstChildOfClass("Animator")
-    if animator then
-        for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
-            local animationType = getRecoveryAnimationType(track)
-            if (animationType == "stun" and CS.AntiStun)
-                or (animationType == "ragdoll" and CS.AntiRagdoll) then
-                track:Stop(0)
-            end
-        end
-    end
-end
-
-local function attachAntiStun(character)
-    disconnectAntiStunConnections()
-    if not (CS.AntiStun or CS.AntiRagdoll) or not character then return end
-
-    local humanoid = character:FindFirstChildOfClass("Humanoid")
-        or character:WaitForChild("Humanoid", 10)
-    if not humanoid then return end
-
-    cancelRecovery(character, humanoid)
-    table.insert(CS.AntiStunConns, character.AttributeChanged:Connect(function(attribute)
-        if (CS.AntiStun and stunAttrs[attribute]) or (CS.AntiRagdoll and ragdollAttrs[attribute]) then
-            task.defer(cancelRecovery, character, humanoid)
-        end
-    end))
-    table.insert(CS.AntiStunConns, humanoid.StateChanged:Connect(function(_, newState)
-        if CS.AntiRagdoll and (newState == Enum.HumanoidStateType.Ragdoll
-                or newState == Enum.HumanoidStateType.FallingDown
-                or newState == Enum.HumanoidStateType.GettingUp
-                or newState == Enum.HumanoidStateType.PlatformStanding) then
-            task.defer(cancelRecovery, character, humanoid)
-        end
-    end))
-
-    local animator = humanoid:FindFirstChildOfClass("Animator")
-        or humanoid:WaitForChild("Animator", 5)
-    if animator then
-        table.insert(CS.AntiStunConns, animator.AnimationPlayed:Connect(function(track)
-            local animationType = getRecoveryAnimationType(track)
-            if (animationType == "stun" and CS.AntiStun)
-                or (animationType == "ragdoll" and CS.AntiRagdoll) then
-                track:Stop(0)
-            end
-        end))
-    end
-end
-
--- Cached character reference (updated on CharacterAdded, avoids per-call lookup)
-local cachedCharacter = LocalPlayer.Character
-
-local function getLocalStaminaModel()
-    return cachedCharacter
-end
-
-local function hookNamecall()
-    if CS.NamecallHooked then return end
-    CS.NamecallHooked = true
-
-    local success, result = pcall(function()
-        CS.OldNamecall = hookmetamethod(game, "__namecall", function(self, ...)
-            if RuntimeProfiler.Enabled then RuntimeProfiler.Namecalls += 1 end
-            if not CS.InfiniteStamina and not CS.NoDodgeCooldown
-                and not CS.AntiStun and not CS.AntiRagdoll
-                and not AutoParry.BlockM1Active and not Dbg.StunEvents then
-                return CS.OldNamecall(self, ...)
-            end
-
-            -- These features only target the local character or combat remotes.
-            -- Avoid resolving the method for unrelated game namecalls.
-            if not Dbg.StunEvents and self ~= cachedCharacter
-                and self ~= RemotesServer and self ~= SprintRemote then
-                return CS.OldNamecall(self, ...)
-            end
-
-            local method = getnamecallmethod()
-
-            if Dbg.StunEvents and (method == "FireServer" or method == "InvokeServer") then
-                stunDebugLog("REMOTE OUT", method, self, { ... })
-            end
-
-            -- ── Stamina ────────────────────────────────────────────── --
-            if CS.InfiniteStamina and self == cachedCharacter then
-                if method == "SetAttribute" then
-                    local attr = select(1, ...)
-                    if attr == "Stamina" then
-                        return CS.OldNamecall(self, "Stamina", 100)
-                    end
-                elseif method == "GetAttribute" then
-                    local attr = select(1, ...)
-                    if attr == "Stamina" then
-                        return 100
-                    end
-                end
-            end
-
-            if CS.InfiniteStamina and method == "FireServer" and SprintRemote and self == SprintRemote then
-                local arg1 = select(1, ...)
-                if type(arg1) == "table" and arg1.Stamina ~= nil then
-                    arg1.Stamina = 100
-                end
-                return CS.OldNamecall(self, ...)
-            end
-
-            -- ── No Dodge Cooldown (manual Q, no auto-loop) ──────────── --
-            if CS.NoDodgeCooldown then
-                if method == "GetAttribute" and self == cachedCharacter then
-                    local attr = select(1, ...)
-                    local spoofValue = dodgeGateSpoof[attr]
-                    if spoofValue ~= nil then
-                        return spoofValue
-                    end
-                elseif method == "SetAttribute" and self == cachedCharacter then
-                    local attr = select(1, ...)
-                    if dodgeBlockedSetAttrs[attr] then
-                        return
-                    end
-                    if attr == "CombatActionToken" then
-                        return CS.OldNamecall(self, "CombatActionToken", 1)
-                    end
-                elseif method == "FireServer" and CS.DodgeCooldownTime > 0 and self == RemotesServer then
-                    local arg1 = select(1, ...)
-                    if type(arg1) == "table"
-                        and arg1.Type == "Combat"
-                        and arg1.Action == "Evasive" then
-                        local now = os.clock()
-                        if now - CS.LastDodgeTime < CS.DodgeCooldownTime then
-                            return
-                        end
-                        CS.LastDodgeTime = now
-                    end
-                end
-            end
-
-            -- ── Independent Anti-Stun / Anti-Ragdoll ───────────────── --
-            if (CS.AntiStun or CS.AntiRagdoll) and method == "GetAttribute" and self == cachedCharacter then
-                local attr = select(1, ...)
-                if (CS.AntiStun and stunAttrs[attr])
-                    or (CS.AntiRagdoll and ragdollAttrs[attr]) then
-                    return nil
-                end
-            end
-
-            -- ── Block M1 Until Parry Confirmed ──────────────────────── --
-            if AutoParry.BlockM1Active and method == "FireServer" and self == RemotesServer then
-                local arg1 = select(1, ...)
-                if type(arg1) == "table" and arg1.Type == "Combat"
-                    and (arg1.Action == "M1" or arg1.Action == "Attack") then
-                    return -- suppress M1 so it doesn't cancel block
-                end
-            end
-
-            return CS.OldNamecall(self, ...)
-        end)
-    end)
-
-    if not success then
-        warn("[BagahHub] __namecall hook failed:", result)
-        CS.NamecallHooked = false
-    else
-        print("[BagahHub] Unified namecall hook active (stamina + dodge)")
-    end
-end
-
-local function setInfiniteStamina(value)
-    CS.InfiniteStamina = value
-    if value then hookNamecall() end
-end
-
-local function setNoDodgeCooldown(value)
-    CS.NoDodgeCooldown = value
-    if value then
-        hookNamecall()
-    end
-end
-
-local function updateRecoveryProtection()
-    if CS.AntiStun or CS.AntiRagdoll then
-        hookNamecall()
-        attachAntiStun(getLocalStaminaModel())
-    else
-        disconnectAntiStunConnections()
-        local character = getLocalStaminaModel()
-        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-        if humanoid then
-            humanoid:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, true)
-            humanoid:SetStateEnabled(Enum.HumanoidStateType.FallingDown, true)
-            humanoid:SetStateEnabled(Enum.HumanoidStateType.GettingUp, true)
-        end
-    end
-end
-
-local function setAntiStun(value)
-    CS.AntiStun = value
-    updateRecoveryProtection()
-end
-
-local function setAntiRagdoll(value)
-    CS.AntiRagdoll = value
-    local character = getLocalStaminaModel()
-    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-    if not value and humanoid then
-        humanoid:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, true)
-        humanoid:SetStateEnabled(Enum.HumanoidStateType.FallingDown, true)
-        humanoid:SetStateEnabled(Enum.HumanoidStateType.GettingUp, true)
-    end
-    updateRecoveryProtection()
-end
-
-LocalPlayer.CharacterAdded:Connect(function(character)
-    cachedCharacter = character
-    if CS.AntiStun or CS.AntiRagdoll then
-        task.defer(attachAntiStun, character)
-    end
-    if Dbg.StunEvents then
-        task.defer(attachStunDebug, character)
-    end
-end)
-
-local function rhythmReleaseAll()
-    for lane, key in ipairs(Rhythm.Keys) do
-        Rhythm.Tokens[key.Name] = nil
-        pcall(function() VirtualInputManager:SendKeyEvent(false, key, false, game) end)
-        local position = Rhythm.TouchPositions[lane]
-        if position then
-            pcall(function()
-                local inset = Rhythm.TouchCorrection or GuiService:GetGuiInset()
-                VirtualInputManager:SendTouchEvent(lane, 2,
-                    position.X + inset.X, position.Y + inset.Y)
-            end)
-        end
-    end
-    table.clear(Rhythm.TouchPositions)
-    table.clear(Rhythm.PendingTouches)
-end
-
-local function rhythmIsNote(instance)
-    return instance:IsA("GuiObject") and instance.Name == "NoteTemplate"
-end
-
-local function rhythmKeyDown(key, duration)
-    local name = key.Name
-    local token = (Rhythm.Tokens[name] or 0) + 1
-    Rhythm.Tokens[name] = token
-    pcall(function() VirtualInputManager:SendKeyEvent(true, key, false, game) end)
-    task.delay(math.clamp(duration or 0.15, 0.05, 5), function()
-        if Rhythm.Tokens[name] == token then
-            Rhythm.Tokens[name] = nil
-            pcall(function() VirtualInputManager:SendKeyEvent(false, key, false, game) end)
-        end
-    end)
-end
-
-local function rhythmSendInput(lane, key, pressed)
-    if Rhythm.TouchMode then
-        local receptor = Rhythm.Receptors[lane]
-        if not receptor or not receptor.Parent or not receptor.Visible then return false end
-        local position = Rhythm.TouchPositions[lane] or Vector2.new(
-            math.floor(receptor.AbsolutePosition.X + receptor.AbsoluteSize.X / 2),
-            math.floor(receptor.AbsolutePosition.Y + receptor.AbsoluteSize.Y / 2)
-        )
-        if pressed then Rhythm.TouchPositions[lane] = position end
-        local correction = Rhythm.TouchCorrection
-        if not correction then
-            correction = Vector2.zero
-            pcall(function()
-                correction = GuiService:GetGuiInset()
-            end)
-        end
-        local inputPosition = position + correction
-        if pressed and not Rhythm.TouchCorrection
-            and next(Rhythm.PendingTouches) == nil then
-            Rhythm.PendingTouches[lane] = {
-                Target = position,
-                Sent = inputPosition,
-                Time = os.clock(),
-            }
-        end
-        local touchSuccess, touchError = pcall(function()
-            VirtualInputManager:SendTouchEvent(lane, pressed and 0 or 2,
-                inputPosition.X, inputPosition.Y)
-        end)
-        rhythmDebug("TOUCH", "lane=", lane, "pressed=", pressed,
-            "id=", lane, "state=", pressed and 0 or 2,
-            "visual=", position.X .. "," .. position.Y,
-            "correction=", correction.X .. "," .. correction.Y,
-            "sent=", inputPosition.X .. "," .. inputPosition.Y,
-            "success=", touchSuccess, "error=", touchError or "none")
-
-        local keySuccess = false
-        if not touchSuccess then
-            keySuccess = pcall(function()
-                VirtualInputManager:SendKeyEvent(pressed, key, false, game)
-            end)
-            rhythmDebug("KEY FALLBACK", "lane=", lane, "key=", key.Name,
-                "pressed=", pressed, "success=", keySuccess)
-        end
-
-        if not touchSuccess and not keySuccess then
-            local mouseSuccess, mouseError = pcall(function()
-                VirtualInputManager:SendMouseButtonEvent(position.X, position.Y,
-                    0, pressed, game, 0)
-            end)
-            rhythmDebug("MOUSE FALLBACK", "lane=", lane, "pressed=", pressed,
-                "success=", mouseSuccess, "error=", mouseError or "none")
-            return mouseSuccess
-        end
-        return true
-    end
-    return pcall(function()
-        VirtualInputManager:SendKeyEvent(pressed, key, false, game)
-    end)
-end
-
-local function rhythmHoldUntilTail(note, receptor, lane, key, fallbackDuration, generation)
-    local name = key.Name
-    local token = (Rhythm.Tokens[name] or 0) + 1
-    Rhythm.Tokens[name] = token
-    rhythmSendInput(lane, key, true)
-
-    task.spawn(function()
-        local started = os.clock()
-        local fallbackAt = started + math.clamp(fallbackDuration or 0.5, 0.25, 5)
-        local released = false
-        while Rhythm.Enabled and generation == Rhythm.Generation
-            and Rhythm.Tokens[name] == token and note.Parent and note.Visible
-            and os.clock() < started + 5.5 do
-            local tail = note:FindFirstChild("Tail")
-            local receptorY = receptor.AbsolutePosition.Y + receptor.AbsoluteSize.Y / 2
-            local endpoint = tail and tail:IsA("GuiObject") and tail.Visible
-                and (tail.AbsolutePosition.Y + tail.AbsoluteSize.Y) or nil
-
-            if endpoint and endpoint <= receptorY + 2 then
-                fallbackAt = math.max(fallbackAt, os.clock() + 0.08)
-            elseif endpoint and os.clock() >= fallbackAt then
-                released = true
-                break
-            elseif not endpoint and os.clock() >= fallbackAt then
-                released = true
-                break
-            end
-            task.wait(0.033) -- ~30fps polling, no need for 60fps on hold notes
-        end
-
-        if Rhythm.Tokens[name] == token then
-            Rhythm.Tokens[name] = nil
-            rhythmSendInput(lane, key, false)
-        end
-    end)
-end
-
-local function rhythmGetHoldDuration(note, receptor, velocity)
-    if not velocity or velocity <= 1 then return nil end
-    local tail = note:FindFirstChild("Tail")
-    if not tail or not tail:IsA("GuiObject") or not tail.Visible then return nil end
-
-    local duration = tail.AbsoluteSize.Y / velocity
-    local extend = (Rhythm.HoldExtendMs or 80) / 1000
-
-    return math.clamp(duration + extend, 0.25, 5.0)
-end
-
-local function rhythmTap(lane, key)
-    rhythmSendInput(lane, key, true)
-    local tapDuration = Rhythm.TouchMode and Rhythm.LaneCount >= 4 and 0.08 or 0.03
-    task.delay(tapDuration, function()
-        rhythmSendInput(lane, key, false)
-    end)
-end
-
-local function rhythmConfigure(root)
-    local receptors = root:FindFirstChild("Receptors", true)
-    if not receptors then return false end
-    local found, foundKeys = {}, {}
-    local candidates = { receptors }
-    for _, object in ipairs(receptors:GetDescendants()) do
-        table.insert(candidates, object)
-    end
-    for _, receptor in ipairs(candidates) do
-        local index = receptor:IsA("GuiObject")
-            and tonumber(receptor.Name:match("^Receptor(%d+)$")) or nil
-        local hint = receptor:FindFirstChild("KeyHint", true)
-        local name = hint and hint:IsA("TextLabel") and hint.Text:upper()
-        if index then
-            found[index] = receptor
-            if name and name ~= "" then
-                local valid, keyCode = pcall(function()
-                    return Enum.KeyCode[name]
-                end)
-                if valid and keyCode then foundKeys[index] = name end
-            end
-        end
-    end
-    local count = 0
-    for i = 1, 4 do
-        if found[i] then count = i else break end
-    end
-    if count == 0 then return false end
-    Rhythm.LaneCount, Rhythm.Keys, Rhythm.Names = count, {}, {}
-    local fallbackKeys = count == 2 and { "F", "J" }
-        or { "X", "C", "N", "M" }
-    Rhythm.Receptors = {}
-    for i = 1, count do
-        local keyName = foundKeys[i] or fallbackKeys[i]
-        Rhythm.Names[i] = keyName
-        Rhythm.Keys[i] = Enum.KeyCode[keyName]
-        Rhythm.Receptors[i] = found[i]
-        local receptor = Rhythm.Receptors[i]
-        rhythmDebug("RECEPTOR", "lane=", i, "object=", receptor,
-            "class=", receptor and receptor.ClassName or "nil",
-            "visible=", receptor and receptor.Visible or "nil",
-            "pos=", receptor and receptor.AbsolutePosition or "nil",
-            "size=", receptor and receptor.AbsoluteSize or "nil")
-    end
-    table.clear(Rhythm.TouchPositions)
-    rhythmDebug("CONFIG", "lanes=", count, "keys=", table.concat(Rhythm.Names, ","))
-    return true
-end
-
-local function rhythmLane(note)
-    local x = note.AbsolutePosition.X + note.AbsoluteSize.X / 2
-    local lane, best = nil, math.huge
-    for i, receptor in ipairs(Rhythm.Receptors) do
-        if receptor and receptor.Parent then
-            local center = receptor.AbsolutePosition.X + receptor.AbsoluteSize.X / 2
-            if math.abs(x - center) < best then lane, best = i, math.abs(x - center) end
-        end
-    end
-    return lane
-end
-
-local function rhythmRegister(note)
-    if not Rhythm.Enabled or not rhythmIsNote(note) then return end
-    local attrLane = note:GetAttribute("NoteLane")
-    local lane = (type(attrLane) == "number" and attrLane >= 1 and attrLane <= Rhythm.LaneCount)
-        and attrLane or rhythmLane(note)
-    if not lane or Rhythm.Active[note] then return end
-    Rhythm.Active[note] = {
-        lane = lane,
-        key = Rhythm.Keys[lane],
-        pressed = false,
-        tail = nil,
-        isHold = false,
-        parent = note.Parent,
-        lastY = nil,
-        lastAt = nil,
-        wasInactive = false,
-        holdDuration = nil,
-        noteTime = note:GetAttribute("NoteTime"),
-        noteLane = lane,
-        lastNoteTime = note:GetAttribute("NoteTime"),
+-- -------------------------------------------------------------------------- --
+--                                 TAB PLAYER                                 --
+-- -------------------------------------------------------------------------- --
+
+local State = {
+    Player = {
+        FlySpeed = 50,
+        FlyEnabled = false,
+        NoclipEnabled = false,
+        SpeedValue = 16,
+        SpeedEnabled = false,
+        JumpPower = 50,
+        BhopHoldEnabled = false,
+        BhopToggleEnabled = false
     }
-    rhythmDebug("NOTE", "registered", note, "lane=", lane,
-        "noteTime=", Rhythm.Active[note].noteTime,
-        "pos=", note.AbsolutePosition, "size=", note.AbsoluteSize)
-end
+}
 
-local function rhythmConnectNoteWatcher(root)
-    if Rhythm.NoteConn then Rhythm.NoteConn:Disconnect() end
-    if Rhythm.NoteRemoveConn then Rhythm.NoteRemoveConn:Disconnect() end
-    Rhythm.NoteConn = root.DescendantAdded:Connect(rhythmRegister)
-    Rhythm.NoteRemoveConn = root.DescendantRemoving:Connect(function(note)
-        Rhythm.Active[note] = nil
+
+local featureStates = {
+    AntiAFK = true,
+    TimerDisplay = false
+}
+
+
+--OTHER REMOTES
+
+local ChangeSettingRemote = ReplicatedStorage.Shared.UserData.Events.Requests:WaitForChild("SetSetting")
+local UpdatedEvent = ReplicatedStorage.Shared.UserData.Events.Channels:WaitForChild("Settings")
+
+-- =========================== GAME STATE TRACKER =========================== --
+-- Evade update besar: workspace.Game.Stats dihapus, ganti ke remote event
+local GameState = {}
+local gameStateListeners = {}
+
+local function initGameState()
+    local ev = ReplicatedStorage:FindFirstChild("Events")
+    if not ev then return end
+    local stateReg = ev:FindFirstChild("UpdateServerStateRegistry")
+    if not stateReg then return end
+
+    stateReg.OnClientEvent:Connect(function(key, value)
+        GameState[key] = value
+        local listeners = gameStateListeners[key]
+        if listeners then
+            for _, cb in ipairs(listeners) do
+                task.spawn(cb, key, value)
+            end
+        end
+        listeners = gameStateListeners["*"]
+        if listeners then
+            for _, cb in ipairs(listeners) do
+                task.spawn(cb, key, value)
+            end
+        end
     end)
 end
 
-local function rhythmResetRecycled(note, data)
-    local attrLane = note:GetAttribute("NoteLane")
-    local lane = (type(attrLane) == "number" and attrLane >= 1 and attrLane <= Rhythm.LaneCount)
-        and attrLane or rhythmLane(note)
-    if not lane then return end
-    data.lane = lane
-    data.key = Rhythm.Keys[lane]
-    data.pressed = false
-    data.parent = note.Parent
-    data.wasInactive = false
-    data.lastY = nil
-    data.lastAt = nil
-    data.holdDuration = nil
-    data.noteTime = note:GetAttribute("NoteTime")
-    data.noteLane = lane
-    data.lastNoteTime = data.noteTime
+function GameState.Get(key, default)
+    return GameState[key] ~= nil and GameState[key] or default
 end
 
-local function rhythmInspectorId(object)
-    local id = Rhythm.InspectorIds[object]
-    if not id then
-        Rhythm.NextInspectorId += 1
-        id = Rhythm.NextInspectorId
-        Rhythm.InspectorIds[object] = id
+function GameState.OnChange(key, callback)
+    if not gameStateListeners[key] then
+        gameStateListeners[key] = {}
     end
-    return object.Name .. "#" .. id
+    table.insert(gameStateListeners[key], callback)
 end
 
--- ── Rating Spy: detect Perfect/Good/Ok/Miss from game UI ─────────────
-local function rhythmConnectRatingSpy(root)
-    if Rhythm.RatingConn then
-        Rhythm.RatingConn:Disconnect()
-        Rhythm.RatingConn = nil
+initGameState()
+
+-- ----------------------------- FLYING FUNCTION ---------------------------- --
+
+local FlyingModule = (function()
+    local flying = false
+    local bodyVelocity, bodyGyro, flyLoop = nil, nil, nil
+    local function startFlying()
+        local char = player.Character
+        if not char then return end
+        local humanoid = char:WaitForChild("Humanoid")
+        local rootPart = char:WaitForChild("HumanoidRootPart")
+        if not humanoid or not rootPart then return end
+        flying = true
+        bodyVelocity = Instance.new("BodyVelocity")
+        bodyVelocity.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
+        bodyVelocity.Velocity = Vector3.zero
+        bodyVelocity.Parent = rootPart
+        bodyGyro = Instance.new("BodyGyro")
+        bodyGyro.MaxTorque = Vector3.new(math.huge, math.huge, math.huge)
+        bodyGyro.CFrame = rootPart.CFrame
+        bodyGyro.Parent = rootPart
+        humanoid.PlatformStand = true
     end
-    if Rhythm.RatingRemoveConn then
-        Rhythm.RatingRemoveConn:Disconnect()
-        Rhythm.RatingRemoveConn = nil
+    local function stopFlying()
+        flying = false
+        if bodyVelocity then
+            bodyVelocity:Destroy()
+            bodyVelocity = nil
+        end
+        if bodyGyro then
+            bodyGyro:Destroy()
+            bodyGyro = nil
+        end
+        if player.Character then
+            local humanoid = player.Character:FindFirstChild("Humanoid")
+            if humanoid then humanoid.PlatformStand = false end
+        end
     end
-    for _, connection in pairs(Rhythm.RatingTextConns) do
-        connection:Disconnect()
+
+
+    local function updateFly()
+        if not flying or not bodyVelocity or not bodyGyro then return end
+        local char = player.Character
+        if not char then return end
+        local humanoid = char:FindFirstChild("Humanoid")
+        if not humanoid then return end
+        local camera = workspace.CurrentCamera
+        local direction = Vector3.zero
+        local moveDir = humanoid.MoveDirection
+        if moveDir.Magnitude > 0 then
+            local forward = camera.CFrame.LookVector
+            local right = camera.CFrame.RightVector
+            direction = direction + (moveDir:Dot(forward) * forward + moveDir:Dot(right) * right).Unit
+        end
+        if game:GetService("UserInputService"):IsKeyDown(Enum.KeyCode.Space) then
+            direction = direction + Vector3.new(0, 1, 0)
+        end
+        if game:GetService("UserInputService"):IsKeyDown(Enum.KeyCode.LeftShift) then
+            direction = direction - Vector3.new(0, 1, 0)
+        end
+        bodyVelocity.Velocity = direction.Magnitude > 0 and direction.Unit * (State.Player.FlySpeed * 2) or Vector3.zero
+        bodyGyro.CFrame = camera.CFrame
     end
-    table.clear(Rhythm.RatingTextConns)
-    if not Rhythm.RatingSpy or not root or not root.Parent then return end
-    local seenRatings = setmetatable({}, { __mode = "k" })
-    local ratingKeywords = { "perfect", "great", "good", "ok", "miss", "bad" }
-    local function checkRating(obj)
-        if not Rhythm.RatingSpy then return end
-        if not obj:IsA("TextLabel") and not obj:IsA("TextButton") then return end
-        local text = obj.Text
-        if not text or text == "" then return end
-        local lower = text:lower()
-        for _, keyword in ipairs(ratingKeywords) do
-            if lower:find(keyword, 1, true) then
-                if seenRatings[obj] ~= keyword then
-                    seenRatings[obj] = keyword
-                    local now = os.clock()
-                    local label = keyword:sub(1, 1):upper() .. keyword:sub(2)
-                    Rhythm.RatingCounts[label] = (Rhythm.RatingCounts[label] or 0) + 1
-                    Rhythm.RatingTotal += 1
-                    -- Delta: time since last key press (manual or auto)
-                    local delta = nil
-                    local latestPress = 0
-                    local pressLane = 0
-                    for lane, t in pairs(Rhythm.LastPressAt) do
-                        if t > latestPress then
-                            latestPress = t; pressLane = lane
-                        end
-                    end
-                    if latestPress > 0 then delta = now - latestPress end
-                    -- Position of the judgement label (correlate to lane)
-                    local pos = nil
-                    pcall(function()
-                        if obj:IsA("GuiObject") then
-                            pos = obj.AbsolutePosition
-                        end
-                    end)
-                    rhythmDebug("RATING", label,
-                        "text=", text,
-                        "pos=", pos and string.format("%.0f,%.0f", pos.X, pos.Y) or "n/a",
-                        "pressLane=", pressLane > 0 and pressLane or "n/a",
-                        "delta=", delta and string.format("%.4f", delta) or "n/a",
-                        "id=", rhythmInspectorId(obj),
-                        "total=", Rhythm.RatingTotal)
-                end
-                return
+    return {
+        Start = function()
+            startFlying()
+            if not flyLoop then
+                flyLoop = RunService.RenderStepped:Connect(updateFly)
             end
+        end,
+        Stop = function()
+            if flyLoop then
+                flyLoop:Disconnect()
+                flyLoop = nil
+            end
+            stopFlying()
         end
-        seenRatings[obj] = nil
+    }
+end)()
+
+-- ---------------------------- NO CLIP FUNCTION ---------------------------- --
+
+local NoclipModule = (function()
+    local connection = nil
+    local function enable()
+        if connection then return end
+        connection = RunService.Stepped:Connect(function()
+            local char = player.Character
+            if not char then return end
+            for _, part in pairs(char:GetDescendants()) do
+                if part:IsA("BasePart") then part.CanCollide = false end
+            end
+        end)
     end
-    local function watchRating(obj)
-        checkRating(obj)
-        if obj:IsA("TextLabel") or obj:IsA("TextButton") then
-            Rhythm.RatingTextConns[obj] = obj:GetPropertyChangedSignal("Text"):Connect(function()
-                checkRating(obj)
-            end)
-        end
-    end
-    Rhythm.RatingConn = root.DescendantAdded:Connect(watchRating)
-    Rhythm.RatingRemoveConn = root.DescendantRemoving:Connect(function(obj)
-        seenRatings[obj] = nil
-        local connection = Rhythm.RatingTextConns[obj]
+    local function disable()
         if connection then
             connection:Disconnect()
-            Rhythm.RatingTextConns[obj] = nil
+            connection = nil
         end
-    end)
-    for _, obj in ipairs(root:GetDescendants()) do
-        if obj:IsA("TextLabel") or obj:IsA("TextButton") then
-            watchRating(obj)
-        end
-    end
-    rhythmDebug("RATING SPY", "started", "monitoring root=", root.Name)
-end
-
-local function rhythmScan()
-    local ui, root = nil, nil
-    for _, object in ipairs(PlayerGui:GetDescendants()) do
-        if object.Name == "RhythmRoot" then
-            local candidateReceptors = object:FindFirstChild("Receptors", true)
-            if candidateReceptors then
-                root = object
-                local ancestor = object.Parent
-                while ancestor and ancestor ~= PlayerGui do
-                    if ancestor.Name == "RhythmServiceUI" then
-                        ui = ancestor
-                        break
-                    end
-                    ancestor = ancestor.Parent
-                end
-                break
-            elseif not root then
-                root = object
+        local char = player.Character
+        if char then
+            for _, part in pairs(char:GetDescendants()) do
+                if part:IsA("BasePart") then part.CanCollide = true end
             end
         end
     end
-    if not root then
-        Rhythm.Root = nil
-        local now = os.clock()
-        if now - Rhythm.LastMissingRootDebug >= 1 then
-            Rhythm.LastMissingRootDebug = now
-            rhythmDebug("SCAN", "no RhythmRoot", "playerGuiDescendants=",
-                #PlayerGui:GetDescendants())
-        end
-        return
-    end
-    local receptorsReady = Rhythm.LaneCount > 0
-    for lane = 1, Rhythm.LaneCount do
-        local receptor = Rhythm.Receptors[lane]
-        if not receptor or not receptor:IsDescendantOf(root) then
-            receptorsReady = false
-            break
-        end
-    end
-    if Rhythm.Root ~= root or not receptorsReady then
-        Rhythm.Root = root
-        if not rhythmConfigure(root) then return end
-        rhythmConnectRatingSpy(root)
-        rhythmConnectNoteWatcher(root)
-        for _, object in ipairs(root:GetDescendants()) do rhythmRegister(object) end
-    end
-end
+    return { Enable = enable, Disable = disable }
+end)()
 
-local function rhythmDebugStructure()
-    local root = Rhythm.Root
-    local ui = root
-    while ui and ui ~= PlayerGui and ui.Name ~= "RhythmServiceUI" do
-        ui = ui.Parent
-    end
-    if ui == PlayerGui then ui = nil end
-    rhythmDebug("UI", "service=", ui, "root=", root)
-    if not root then return end
+-- ------------------------- CFRAME SPEED FUNCTION -------------------------- --
 
-    rhythmConfigure(root)
-    local descendants = root:GetDescendants()
-    rhythmDebug("STRUCTURE", "descendants=", #descendants)
-    for index, object in ipairs(descendants) do
-        if index > 120 then
-            rhythmDebug("STRUCTURE", "truncated after 120 descendants")
-            break
-        end
-        if object:IsA("GuiObject") then
-            rhythmDebug("GUI", index, object.Name, "class=", object.ClassName,
-                "parent=", object.Parent and object.Parent.Name or "nil",
-                "visible=", object.Visible, "pos=", object.AbsolutePosition,
-                "size=", object.AbsoluteSize)
-        else
-            rhythmDebug("OBJECT", index, object.Name, "class=", object.ClassName,
-                "parent=", object.Parent and object.Parent.Name or "nil")
-        end
-    end
-end
+local CFrameSpeedModule = (function()
+    local connection = nil
+    local function start()
+        if connection then return end
+        connection = RunService.RenderStepped:Connect(function()
+            local char = player.Character
+            if not char then return end
+            local humanoid = char:FindFirstChildOfClass("Humanoid")
+            local rootPart = char:FindFirstChild("HumanoidRootPart")
+            if not humanoid or not rootPart then return end
 
-local function rhythmDisconnectGuiInspector()
-    for _, connection in ipairs(Rhythm.InspectorConnections) do connection:Disconnect() end
-    table.clear(Rhythm.InspectorConnections)
-    Rhythm.InspectorRoot = nil
-end
-
-local function rhythmInspectorPath(object)
-    local parts = {}
-    while object and object ~= PlayerGui do
-        table.insert(parts, 1, object.Name)
-        object = object.Parent
-    end
-    return "PlayerGui/" .. table.concat(parts, "/")
-end
-
-local function rhythmInspectObject(object, event)
-    if not Rhythm.GuiInspector or not object then return end
-    local details = { event, "id=", rhythmInspectorId(object), "path=", rhythmInspectorPath(object), "class=", object
-        .ClassName,
-        "parent=", object.Parent and object.Parent.Name or "nil" }
-    if object:IsA("GuiObject") then
-        table.insert(details, "visible="); table.insert(details, object.Visible)
-        table.insert(details, "pos="); table.insert(details, object.AbsolutePosition)
-        table.insert(details, "size="); table.insert(details, object.AbsoluteSize)
-        table.insert(details, "z="); table.insert(details, object.ZIndex)
-        table.insert(details, "layoutPos="); table.insert(details, object.Position)
-        table.insert(details, "layoutSize="); table.insert(details, object.Size)
-    end
-    if object:IsA("TextLabel") or object:IsA("TextButton") or object:IsA("TextBox") then
-        table.insert(details, "text="); table.insert(details, string.format("%q", object.Text))
-        table.insert(details, "textTransparency="); table.insert(details, object.TextTransparency)
-    elseif object:IsA("ImageLabel") or object:IsA("ImageButton") then
-        table.insert(details, "image="); table.insert(details, object.Image)
-        table.insert(details, "imageTransparency="); table.insert(details, object.ImageTransparency)
-    end
-    for name, value in pairs(object:GetAttributes()) do
-        table.insert(details, "attr." .. name .. "="); table.insert(details, value)
-    end
-    rhythmDebug("GUI INSPECT", table.unpack(details))
-end
-
-local function rhythmWatchInspectedObject(object)
-    local lowerName = object.Name:lower()
-    local focused = lowerName:find("hitshard", 1, true)
-        or lowerName:find("judgement", 1, true)
-        or lowerName:find("note", 1, true)
-    if not focused then return end
-    rhythmInspectObject(object, "WATCH")
-    local properties = { "Name", "Parent" }
-    if object:IsA("GuiObject") then
-        -- Position and Size animate continuously while notes travel. Logging those
-        -- signals floods the report and hides lifecycle and judgement changes.
-        table.insert(properties, "Visible")
-    end
-    if object:IsA("TextLabel") or object:IsA("TextButton") or object:IsA("TextBox") then
-        -- TextTransparency is commonly tweened every frame on judgements. Its
-        -- initial/final values are already captured by WATCH and REMOVING.
-        table.insert(properties, "Text")
-    elseif object:IsA("ImageLabel") or object:IsA("ImageButton") then
-        table.insert(properties, "Image"); table.insert(properties, "ImageTransparency")
-    end
-    for _, property in ipairs(properties) do
-        table.insert(Rhythm.InspectorConnections,
-            object:GetPropertyChangedSignal(property):Connect(function()
-                rhythmInspectObject(object, "CHANGED " .. property)
-            end))
-    end
-    table.insert(Rhythm.InspectorConnections, object.AttributeChanged:Connect(function(attribute)
-        rhythmInspectObject(object, "ATTRIBUTE " .. attribute)
-    end))
-end
-
-local function rhythmInspectClockMetadata(ui, root)
-    local clockKeywords = { "song", "music", "time", "clock", "playback", "start", "bpm", "beat", "speed", "offset" }
-    local logged = 0
-    table.clear(Rhythm.ClockEvidence)
-    local function logClock(...)
-        local values = { ... }
-        for index, value in ipairs(values) do values[index] = tostring(value) end
-        local line = table.concat(values, " ")
-        table.insert(Rhythm.ClockEvidence, line)
-        rhythmDebug("CLOCK", line)
-    end
-    local function relevant(name)
-        name = name:lower()
-        for _, keyword in ipairs(clockKeywords) do
-            if name:find(keyword, 1, true) then return true end
-        end
-        return false
-    end
-    local searchRoot = ui or root
-    if not searchRoot then return end
-    local objects = { searchRoot }
-    for _, object in ipairs(searchRoot:GetDescendants()) do table.insert(objects, object) end
-    for _, object in ipairs(objects) do
-        if logged >= 80 then
-            logClock("truncated after 80 candidates")
-            break
-        end
-        local isSound = object:IsA("Sound")
-        local isNamedValue = object:IsA("ValueBase") and relevant(object.Name)
-        if isSound or isNamedValue then
-            logged += 1
-            if isSound then
-                logClock("id=", rhythmInspectorId(object), "path=", rhythmInspectorPath(object),
-                    "class=Sound", "playing=", object.Playing, "timePosition=", object.TimePosition,
-                    "timeLength=", object.TimeLength, "playbackSpeed=", object.PlaybackSpeed,
-                    "soundId=", object.SoundId)
-            else
-                logClock("id=", rhythmInspectorId(object), "path=", rhythmInspectorPath(object),
-                    "class=", object.ClassName, "value=", object.Value)
-            end
-        end
-        for attribute, value in pairs(object:GetAttributes()) do
-            if relevant(attribute) then
-                logged += 1
-                logClock("id=", rhythmInspectorId(object), "path=", rhythmInspectorPath(object),
-                    "attribute=", attribute, "value=", value)
-                if logged >= 80 then break end
-            end
-        end
-    end
-    logClock("candidates=", logged)
-end
-
-local function rhythmConnectGuiInspector()
-    rhythmDisconnectGuiInspector()
-    if not Rhythm.GuiInspector then return end
-    local ui = PlayerGui:FindFirstChild("RhythmServiceUI")
-    local root = ui and ui:FindFirstChild("RhythmRoot") or Rhythm.Root
-    rhythmDebug("GUI INSPECT", "SNAPSHOT", "service=", ui or "missing", "root=", root or "missing")
-    if ui then rhythmInspectObject(ui, "TARGET") end
-    if not root then return end
-    Rhythm.InspectorRoot = root
-    rhythmInspectObject(root, "TARGET")
-    rhythmInspectClockMetadata(ui, root)
-    local judgement = root:FindFirstChild("JudgementTemplate", true)
-    rhythmDebug("GUI INSPECT", "judgement=", judgement or "missing")
-    if judgement then rhythmInspectObject(judgement, "TARGET") end
-    for _, object in ipairs(root:GetDescendants()) do rhythmWatchInspectedObject(object) end
-    table.insert(Rhythm.InspectorConnections, root.DescendantAdded:Connect(function(object)
-        rhythmInspectObject(object, "ADDED")
-        rhythmWatchInspectedObject(object)
-    end))
-    table.insert(Rhythm.InspectorConnections, root.DescendantRemoving:Connect(function(object)
-        local name = object.Name:lower()
-        if name:find("hitshard", 1, true) or name:find("judgement", 1, true)
-            or name:find("note", 1, true) then
-            rhythmInspectObject(object, "REMOVING")
-        end
-    end))
-    rhythmDebug("GUI INSPECT", "watching", rhythmInspectorPath(root),
-        "descendants=", #root:GetDescendants())
-end
-
-local function rhythmDebugAndroidHierarchy()
-    local descendants = PlayerGui:GetDescendants()
-    rhythmDebug("ANDROID", "playerGuiDescendants=", #descendants,
-        "viewport=", workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or "nil")
-
-    for index, child in ipairs(PlayerGui:GetChildren()) do
-        rhythmDebug("ANDROID ROOT", index, child.Name, "class=", child.ClassName,
-            "enabled=", child:IsA("ScreenGui") and child.Enabled or "n/a")
-    end
-
-    local matched = 0
-    for _, object in ipairs(descendants) do
-        local lowerName = object.Name:lower()
-        local relevantName = lowerName:find("rhythm", 1, true)
-            or lowerName:find("note", 1, true)
-            or lowerName:find("receptor", 1, true)
-            or lowerName:find("lane", 1, true)
-            or lowerName:find("keyhint", 1, true)
-        if relevantName then
-            matched += 1
-            if matched <= 300 then
-                local path = {}
-                local ancestor = object
-                while ancestor and ancestor ~= PlayerGui do
-                    table.insert(path, 1, ancestor.Name)
-                    ancestor = ancestor.Parent
-                end
-                if object:IsA("GuiObject") then
-                    rhythmDebug("ANDROID MATCH", matched, table.concat(path, "/"),
-                        "class=", object.ClassName, "visible=", object.Visible,
-                        "pos=", object.AbsolutePosition, "size=", object.AbsoluteSize,
-                        "z=", object.ZIndex)
-                else
-                    rhythmDebug("ANDROID MATCH", matched, table.concat(path, "/"),
-                        "class=", object.ClassName)
-                end
-            end
-        end
-    end
-    rhythmDebug("ANDROID", "nameMatches=", matched,
-        matched > 300 and "truncated=300" or "complete")
-end
-
--- ── Timing mode: returns delay before press (0 = immediate) ───────────
-local function rhythmGetCustomDelay()
-    if Rhythm.Mode == "perfect" then
-        return 0
-    end
-    local roll = math.random(1, 100)
-    if roll <= Rhythm.PerfectChance then
-        return 0
-    elseif roll <= Rhythm.PerfectChance + Rhythm.GoodChance then
-        return math.random() * 0.025 + 0.005
-    elseif roll <= Rhythm.PerfectChance + Rhythm.GoodChance + Rhythm.OkChance then
-        return math.random() * 0.040 + 0.025
-    else
-        return math.random() * 0.060 + 0.050
-    end
-end
-
-local function rhythmGetPressLead()
-    local leadMs = Rhythm.PressLeadMs or 0
-    if Rhythm.TouchMode then
-        leadMs += (Rhythm.TouchLeadTime or 0) * 1000
-    end
-    if Rhythm.LaneCount == 2 then
-        leadMs += Rhythm.TwoLaneLeadMs or 0
-    end
-    return leadMs / 1000
-end
-
-local function rhythmCalibrateScrollSpeed(note, data, now, noteY)
-    if data.lastY and data.lastAt then
-        local dt = now - data.lastAt
-        local dy = noteY - data.lastY
-        if dt > 0.001 and math.abs(dy) >= 2 and math.abs(dy) < 120 then
-            local speed = dy / dt
-            if speed > 50 and speed < 2000 then
-                table.insert(Rhythm.ScrollSpeedSamples, speed)
-                if #Rhythm.ScrollSpeedSamples > 60 then
-                    table.remove(Rhythm.ScrollSpeedSamples, 1)
-                end
-                Rhythm.ScrollSpeedDirty = (Rhythm.ScrollSpeedDirty or 0) + 1
-                if #Rhythm.ScrollSpeedSamples >= 5 and Rhythm.ScrollSpeedDirty >= 5 then
-                    Rhythm.ScrollSpeedDirty = 0
-                    local sorted = {}
-                    for _, s in ipairs(Rhythm.ScrollSpeedSamples) do
-                        table.insert(sorted, s)
-                    end
-                    table.sort(sorted)
-                    local median = sorted[math.ceil(#sorted / 2)]
-                    if not Rhythm.ScrollSpeed then
-                        Rhythm.ScrollSpeed = median
-                    else
-                        local clampedMedian = math.clamp(median,
-                            Rhythm.ScrollSpeed * 0.92, Rhythm.ScrollSpeed * 1.08)
-                        Rhythm.ScrollSpeed = Rhythm.ScrollSpeed * 0.7 + clampedMedian * 0.3
-                    end
-                end
-            end
-            return speed
-        end
-    end
-    return nil
-end
-
-local function rhythmDeriveSongTime(noteTime, noteY, receptorY)
-    if not Rhythm.ScrollSpeed or Rhythm.ScrollSpeed <= 0 then return nil end
-    local distanceToReceptor = receptorY - noteY
-    local timeToHit = distanceToReceptor / Rhythm.ScrollSpeed
-    return noteTime - timeToHit, timeToHit
-end
-
-local function rhythmStep()
-    if not Rhythm.Enabled then return end
-    local now = os.clock()
-    local profileStartedAt = RuntimeProfiler.Enabled and now or nil
-    if (not Rhythm.Root or not Rhythm.Root.Parent)
-        and now - Rhythm.LastScan >= Rhythm.ScanInterval then
-        Rhythm.LastScan = now
-        rhythmScan()
-    end
-    if Rhythm.DebugEnabled and Rhythm.Root
-        and Rhythm.DebugRootReported ~= Rhythm.Root then
-        Rhythm.DebugRootReported = Rhythm.Root
-        rhythmDebugStructure()
-    end
-
-    local songTimeVotes = Rhythm._songTimeVotes or {}
-    Rhythm._songTimeVotes = songTimeVotes
-    table.clear(songTimeVotes)
-    local pressLead = rhythmGetPressLead()
-
-    for note, data in pairs(Rhythm.Active) do
-        if not note.Parent then
-            Rhythm.Active[note] = nil
-        elseif note.Parent.Name == "OffscreenPool" or not note.Visible then
-            data.wasInactive = true
-            data.lastY = nil; data.lastAt = nil
-            if data.pressed then data.pressed = false end
-        else
-            local noteTime = note:GetAttribute("NoteTime")
-            if data.wasInactive or data.parent ~= note.Parent
-                or (noteTime and data.lastNoteTime and noteTime ~= data.lastNoteTime) then
-                rhythmResetRecycled(note, data)
-            end
-            data.lastNoteTime = noteTime
-            data.noteTime = noteTime
-
-            if not data.pressed and Rhythm.Receptors[data.lane] then
-                data.tail = note:FindFirstChild("Tail")
-                data.isHold = data.tail and data.tail:IsA("GuiObject")
-                    and data.tail.Visible and data.tail.AbsoluteSize.Y > 1 or false
-
-                local receptor = Rhythm.Receptors[data.lane]
-                local noteY = note.AbsolutePosition.Y + note.AbsoluteSize.Y / 2
-                local receptorY = receptor.AbsolutePosition.Y + receptor.AbsoluteSize.Y / 2
-                local frameVelocity = rhythmCalibrateScrollSpeed(note, data, now, noteY)
-                data.lastY, data.lastAt = noteY, now
-
-                local effectiveSpeed = Rhythm.ScrollSpeed
-                if data.isHold and effectiveSpeed and effectiveSpeed > 1 then
-                    data.holdDuration = rhythmGetHoldDuration(note, receptor, effectiveSpeed)
-                end
-
-                if noteTime and Rhythm.ScrollSpeed and #Rhythm.ScrollSpeedSamples >= 15 then
-                    local songTime, timeToHit = rhythmDeriveSongTime(noteTime, noteY, receptorY)
-                    if songTime then
-                        table.insert(songTimeVotes, songTime)
-                    end
-
-                    if timeToHit and timeToHit <= 0.005 + pressLead and timeToHit >= -0.080
-                        and now - (Rhythm.LastPress[data.lane] or 0) >= Rhythm.MinInterval then
-                        data.pressed = true
-                        Rhythm.LastPress[data.lane] = now
-                        Rhythm.LastPressAt[data.lane] = now
-                        local scheduledHold = data.isHold and data.holdDuration or nil
-                        local generation = Rhythm.Generation
-                        local customDelay = rhythmGetCustomDelay()
-                        rhythmDebug("HIT", "lane=", data.lane, "noteTime=", string.format("%.4f", noteTime),
-                            "timeToHit=", string.format("%.4f", timeToHit),
-                            "scrollSpeed=", string.format("%.1f", Rhythm.ScrollSpeed),
-                            "lead=", string.format("%.4f", pressLead), "hold=", scheduledHold ~= nil,
-                            "customDelay=", string.format("%.4f", customDelay))
-                        if customDelay <= 0 then
-                            if scheduledHold then
-                                rhythmHoldUntilTail(note, receptor, data.lane, data.key,
-                                    scheduledHold, generation)
-                            else
-                                rhythmTap(data.lane, data.key)
-                            end
-                        else
-                            task.delay(customDelay, function()
-                                if not Rhythm.Enabled or generation ~= Rhythm.Generation then return end
-                                if scheduledHold then
-                                    rhythmHoldUntilTail(note, receptor, data.lane, data.key,
-                                        scheduledHold, generation)
-                                else
-                                    rhythmTap(data.lane, data.key)
-                                end
-                            end)
-                        end
-                    end
-                elseif frameVelocity and frameVelocity > 1 then
-                    local eta = (receptorY - noteY) / frameVelocity
-                    if eta <= 0.005 + pressLead and eta >= -0.080
-                        and now - (Rhythm.LastPress[data.lane] or 0) >= Rhythm.MinInterval then
-                        data.pressed = true
-                        Rhythm.LastPress[data.lane] = now
-                        Rhythm.LastPressAt[data.lane] = now
-                        local scheduledHold = data.isHold and data.holdDuration or nil
-                        local generation = Rhythm.Generation
-                        local customDelay = rhythmGetCustomDelay()
-                        rhythmDebug("HIT", "lane=", data.lane, "eta=", string.format("%.4f", eta),
-                            "velocity=", string.format("%.2f", frameVelocity),
-                            "lead=", string.format("%.4f", pressLead), "hold=", scheduledHold ~= nil,
-                            "noteY=", string.format("%.1f", noteY), "targetY=", string.format("%.1f", receptorY),
-                            "customDelay=", string.format("%.4f", customDelay))
-                        if customDelay <= 0 then
-                            if scheduledHold then
-                                rhythmHoldUntilTail(note, receptor, data.lane, data.key,
-                                    scheduledHold, generation)
-                            else
-                                rhythmTap(data.lane, data.key)
-                            end
-                        else
-                            task.delay(customDelay, function()
-                                if not Rhythm.Enabled or generation ~= Rhythm.Generation then return end
-                                if scheduledHold then
-                                    rhythmHoldUntilTail(note, receptor, data.lane, data.key,
-                                        scheduledHold, generation)
-                                else
-                                    rhythmTap(data.lane, data.key)
-                                end
-                            end)
-                        end
-                    end
-                end
-            else
-                local noteY = note.AbsolutePosition.Y + note.AbsoluteSize.Y / 2
-                rhythmCalibrateScrollSpeed(note, data, now, noteY)
-                data.lastY, data.lastAt = noteY, now
-            end
-        end
-    end
-
-    if #songTimeVotes > 0 then
-        local sum = 0
-        for _, v in ipairs(songTimeVotes) do sum += v end
-        Rhythm.SongTime = sum / #songTimeVotes
-        Rhythm.LastSongTimeAt = now
-    end
-    if profileStartedAt then
-        RuntimeProfiler.RhythmFrames += 1
-        RuntimeProfiler.RhythmTime += os.clock() - profileStartedAt
-    end
-end
-
-local function setRhythmEnabled(value)
-    Rhythm.Enabled = value
-    Rhythm.Generation += 1
-    if not value then
-        rhythmReleaseAll()
-        table.clear(Rhythm.Active)
-        table.clear(Rhythm.ScrollSpeedSamples)
-        Rhythm.ScrollSpeed = nil
-        Rhythm.SongTime = nil
-        Rhythm.SongTimeSamples = {}
-        Rhythm.Root = nil
-        if Rhythm.RatingConn then
-            Rhythm.RatingConn:Disconnect(); Rhythm.RatingConn = nil
-        end
-        if Rhythm.RatingRemoveConn then
-            Rhythm.RatingRemoveConn:Disconnect(); Rhythm.RatingRemoveConn = nil
-        end
-        for _, connection in pairs(Rhythm.RatingTextConns) do connection:Disconnect() end
-        table.clear(Rhythm.RatingTextConns)
-        if Rhythm.NoteConn then
-            Rhythm.NoteConn:Disconnect(); Rhythm.NoteConn = nil
-        end
-        if Rhythm.NoteRemoveConn then
-            Rhythm.NoteRemoveConn:Disconnect(); Rhythm.NoteRemoveConn = nil
-        end
-        if Rhythm.RenderConn then
-            Rhythm.RenderConn:Disconnect()
-            Rhythm.RenderConn = nil
-        end
-    else
-        Rhythm.LastScan = 0
-        rhythmScan()
-        if not Rhythm.RenderConn then
-            Rhythm.RenderConn = RunService.RenderStepped:Connect(rhythmStep)
-        end
-    end
-    rhythmDebug("STATE", value and "enabled" or "disabled",
-        "TouchEnabled=", UserInputService.TouchEnabled,
-        "KeyboardEnabled=", UserInputService.KeyboardEnabled,
-        "TouchMode=", Rhythm.TouchMode)
-end
-UserInputService.InputBegan:Connect(function(input, processed)
-    if processed then return end
-    if input.KeyCode == Enum.KeyCode.F6
-        or (NO_UI_TEST_MODE and input.KeyCode == Enum.KeyCode.F3) then
-        setRhythmEnabled(not Rhythm.Enabled)
-    end
-end)
-PlayerGui.ChildAdded:Connect(function(child)
-    if child.Name == "RhythmServiceUI" then
-        task.delay(0.3, function()
-            rhythmScan()
-            if Rhythm.GuiInspector then rhythmConnectGuiInspector() end
-        end)
-    end
-end)
-PlayerGui.DescendantAdded:Connect(function(descendant)
-    if descendant.Name == "RhythmRoot" and Rhythm.GuiInspector then
-        task.defer(function()
-            if descendant.Parent and Rhythm.InspectorRoot ~= descendant then
-                rhythmScan()
-                rhythmConnectGuiInspector()
-            end
-        end)
-    end
-end)
-PlayerGui.ChildRemoved:Connect(function(child)
-    if child.Name == "RhythmServiceUI" then
-        Rhythm.Generation += 1
-        Rhythm.Root = nil; table.clear(Rhythm.Active); rhythmReleaseAll()
-        if Rhythm.GuiInspector then
-            rhythmDisconnectGuiInspector()
-            rhythmDebug("GUI INSPECT", "detached; RhythmServiceUI removed")
-        end
-        if Rhythm.RatingConn then
-            Rhythm.RatingConn:Disconnect(); Rhythm.RatingConn = nil
-        end
-        if Rhythm.RatingRemoveConn then
-            Rhythm.RatingRemoveConn:Disconnect(); Rhythm.RatingRemoveConn = nil
-        end
-        for _, connection in pairs(Rhythm.RatingTextConns) do connection:Disconnect() end
-        table.clear(Rhythm.RatingTextConns)
-        if Rhythm.NoteConn then
-            Rhythm.NoteConn:Disconnect(); Rhythm.NoteConn = nil
-        end
-        if Rhythm.NoteRemoveConn then
-            Rhythm.NoteRemoveConn:Disconnect(); Rhythm.NoteRemoveConn = nil
-        end
-    end
-end)
-
-local Fly = { Enabled = false, Speed = 50, BV = nil, BG = nil, Conn = nil, Humanoid = nil, Root = nil }
-
-local function startFly()
-    local char = LocalPlayer.Character
-    if not char then return end
-    local rootPart = char:FindFirstChild("HumanoidRootPart")
-    local humanoid = char:FindFirstChild("Humanoid")
-    if not rootPart or not humanoid then return end
-    Fly.Enabled = true
-    Fly.Humanoid = humanoid
-    Fly.Root = rootPart
-    Fly.BV = Instance.new("BodyVelocity")
-    Fly.BV.MaxForce = Vector3.new(400000, 400000, 400000)
-    Fly.BV.Velocity = Vector3.zero
-    Fly.BV.Parent = rootPart
-    Fly.BG = Instance.new("BodyGyro")
-    Fly.BG.MaxTorque = Vector3.new(400000, 400000, 400000)
-    Fly.BG.CFrame = rootPart.CFrame
-    Fly.BG.Parent = rootPart
-    humanoid.PlatformStand = true
-    if not Fly.Conn then
-        Fly.Conn = RunService.Heartbeat:Connect(function()
-            if not Fly.Enabled or not Fly.BV or not Fly.BG then return end
-            if not Fly.Humanoid or not Fly.Humanoid.Parent then return end
-            local camera = workspace.CurrentCamera
-            local direction = Vector3.zero
-            local moveDir = Fly.Humanoid.MoveDirection
+            local moveDir = humanoid.MoveDirection
             if moveDir.Magnitude > 0 then
-                local forward = camera.CFrame.LookVector
-                local right = camera.CFrame.RightVector
-                local flatDir = (moveDir:Dot(forward) * forward + moveDir:Dot(right) * right)
-                if flatDir.Magnitude > 0 then direction = flatDir.Unit end
+                rootPart.CFrame = rootPart.CFrame + moveDir * math.max(State.Player.SpeedValue, 1) * 0.080
             end
-            if UserInputService:IsKeyDown(Enum.KeyCode.Space) then
-                direction += Vector3.new(0, 1, 0)
-            end
-            if UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) then
-                direction -= Vector3.new(0, 1, 0)
-            end
-            Fly.BV.Velocity = direction.Magnitude > 0 and direction.Unit * Fly.Speed or Vector3.zero
-            Fly.BG.CFrame = camera.CFrame
         end)
     end
-end
-
-local function stopFly()
-    Fly.Enabled = false
-    if Fly.Conn then
-        Fly.Conn:Disconnect(); Fly.Conn = nil
-    end
-    if Fly.BV then
-        Fly.BV:Destroy(); Fly.BV = nil
-    end
-    if Fly.BG then
-        Fly.BG:Destroy(); Fly.BG = nil
-    end
-    if Fly.Humanoid and Fly.Humanoid.Parent then
-        Fly.Humanoid.PlatformStand = false
-    end
-    Fly.Humanoid = nil
-    Fly.Root = nil
-end
-
-local Noclip = { Enabled = false, Conn = nil, Parts = {} }
-
-local function noclipCacheParts(character)
-    table.clear(Noclip.Parts)
-    if not character then return end
-    for _, part in ipairs(character:GetDescendants()) do
-        if part:IsA("BasePart") then
-            table.insert(Noclip.Parts, part)
+    local function stop()
+        if connection then
+            connection:Disconnect()
+            connection = nil
         end
     end
-end
+    return { Start = start, Stop = stop }
+end)()
 
-local function enableNoclip()
-    if Noclip.Conn then return end
-    noclipCacheParts(LocalPlayer.Character)
-    Noclip.Conn = RunService.Stepped:Connect(function()
-        for _, part in ipairs(Noclip.Parts) do
-            if part.Parent then part.CanCollide = false end
+-- ----------------------------- BHOP FUNCTION ------------------------------ --
+
+local BhopModule = (function()
+    local isHoldingSpace = false
+    local stateConnection = nil
+    local inputBeganConnection = nil
+    local inputEndedConnection = nil
+    local characterAddedConnection = nil
+
+    local function connectBhop(humanoid)
+        if stateConnection then
+            stateConnection:Disconnect()
         end
-    end)
-end
-
-local function disableNoclip()
-    if Noclip.Conn then
-        Noclip.Conn:Disconnect(); Noclip.Conn = nil
+        stateConnection = humanoid.StateChanged:Connect(function(_, newState)
+            if newState == Enum.HumanoidStateType.Landed then
+                if isHoldingSpace and State.Player.BhopHoldEnabled then
+                    humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+                end
+            end
+        end)
     end
-    for _, part in ipairs(Noclip.Parts) do
-        pcall(function() part.CanCollide = true end)
-    end
-    table.clear(Noclip.Parts)
-end
 
-LocalPlayer.CharacterAdded:Connect(function(character)
-    local wasFlying = Fly.Enabled
-    local wasNoclipping = Noclip.Enabled
-    if Fly.Enabled then stopFly() end
-    if Noclip.Enabled then disableNoclip() end
-    if wasFlying then
-        task.wait(0.5)
-        startFly()
-    end
-    if wasNoclipping then
-        task.wait(0.3)
-        enableNoclip()
-    end
-end)
+    local function start()
+        -- Input handling
+        inputBeganConnection = UserInputService.InputBegan:Connect(function(input, gameProcessed)
+            if input.KeyCode == Enum.KeyCode.Space and not gameProcessed then
+                isHoldingSpace = true
+            end
+        end)
 
-local PlayerTab = Window:Tab({ Title = "Player", Icon = "move" })
+        inputEndedConnection = UserInputService.InputEnded:Connect(function(input, gameProcessed)
+            if input.KeyCode == Enum.KeyCode.Space then
+                isHoldingSpace = false
+            end
+        end)
 
-PlayerTab:Toggle({
-    Title = "Infinite Stamina",
-    Description = "Bypass stamina drain via namecall hook + sprint remote intercept",
-    Default = false,
-    Callback = function(value)
-        setInfiniteStamina(value)
+        -- Connect to current character
+        if player.Character then
+            local humanoid = player.Character:FindFirstChildOfClass("Humanoid")
+            if humanoid then
+                connectBhop(humanoid)
+            end
+        end
+
+        -- Reconnect on character respawn
+        characterAddedConnection = player.CharacterAdded:Connect(function(character)
+            local humanoid = character:WaitForChild("Humanoid")
+            connectBhop(humanoid)
+        end)
     end
-})
 
-PlayerTab:Toggle({
-    Title = "No Dodge Cooldown",
-    Description = "Remove local cooldown so you can spam Q without waiting",
-    Default = false,
-    Callback = function(value)
-        setNoDodgeCooldown(value)
+    local function stop()
+        isHoldingSpace = false
+
+        if inputBeganConnection then
+            inputBeganConnection:Disconnect()
+            inputBeganConnection = nil
+        end
+
+        if inputEndedConnection then
+            inputEndedConnection:Disconnect()
+            inputEndedConnection = nil
+        end
+
+        if stateConnection then
+            stateConnection:Disconnect()
+            stateConnection = nil
+        end
+
+        if characterAddedConnection then
+            characterAddedConnection:Disconnect()
+            characterAddedConnection = nil
+        end
     end
-})
 
-PlayerTab:Toggle({
-    Title = "No Stun Animation",
-    Description = "Hide stun, guard-break, and recovery animations; server attack lock still applies",
-    Default = false,
-    Callback = function(value)
-        setAntiStun(value)
+    return { Start = start, Stop = stop }
+end)()
+
+-- ----------------------- BHOP TOGGLE FUNCTION (AUTO) ---------------------- --
+
+local BhopToggleModule = (function()
+    local stateConnection = nil
+    local characterAddedConnection = nil
+
+    local function connectBhopToggle(humanoid)
+        if stateConnection then
+            stateConnection:Disconnect()
+        end
+        stateConnection = humanoid.StateChanged:Connect(function(_, newState)
+            if newState == Enum.HumanoidStateType.Landed then
+                if State.Player.BhopToggleEnabled then
+                    task.wait(0.1) -- Small delay untuk stability
+                    humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+                end
+            end
+        end)
     end
-})
 
-PlayerTab:Toggle({
-    Title = "Anti-Ragdoll",
-    Description = "Prevent ragdoll, knockdown, and get-up animations",
-    Default = false,
-    Callback = function(value)
-        setAntiRagdoll(value)
+    local function start()
+        -- Connect to current character
+        if player.Character then
+            local humanoid = player.Character:FindFirstChildOfClass("Humanoid")
+            if humanoid then
+                connectBhopToggle(humanoid)
+            end
+        end
+
+        -- Reconnect on character respawn
+        characterAddedConnection = player.CharacterAdded:Connect(function(character)
+            local humanoid = character:WaitForChild("Humanoid")
+            connectBhopToggle(humanoid)
+        end)
     end
-})
 
-PlayerTab:Slider({
-    Title = "Dodge Cooldown",
-    Description = "Custom delay between dodges (0 = instant, no cooldown)",
-    Flag = "DodgeCooldownSlider",
-    Value = { Min = 0, Max = 3, Default = 0 },
-    Step = 0.05,
-    Callback = function(value)
-        CS.DodgeCooldownTime = value
-        CS.LastDodgeTime = 0 -- reset throttle so new value applies immediately
+    local function stop()
+        if stateConnection then
+            stateConnection:Disconnect()
+            stateConnection = nil
+        end
+
+        if characterAddedConnection then
+            characterAddedConnection:Disconnect()
+            characterAddedConnection = nil
+        end
     end
-})
 
+    return { Start = start, Stop = stop }
+end)()
+
+-- ------------------------------- UI FUNCTION ------------------------------ --
+
+local PlayerTab = Window:Tab({ Icon = "user", Title = "Player" })
+
+PlayerTab:Section({ Title = "Movement Control", TextSize = 20 })
 PlayerTab:Divider()
 
 PlayerTab:Toggle({
     Title = "Fly",
-    Description = "Fly freely using WASD, Space to go up, LeftShift to go down",
-    Default = false,
-    Callback = function(value)
-        if value then
-            startFly()
+    Flag = "FlyToggle",
+    Desc = "Make your character flying",
+    Value = State.Player.FlyEnabled,
+    Callback = function(state)
+        State.Player.FlyEnabled = state
+        if state then
+            FlyingModule.Start()
+            Success("Fly Enabled", "You are now flying!", 2)
         else
-            stopFly()
+            FlyingModule.Stop()
+            Success("Fly Disabled", "Flying disabled", 2)
         end
     end
 })
 
 PlayerTab:Slider({
     Title = "Fly Speed",
-    Description = "Adjust flight speed",
     Flag = "FlySpeedSlider",
-    Value = { Min = 20, Max = 200, Default = 50 },
-    Step = 5,
+    Value = { Min = 10, Max = 200, Default = State.Player.FlySpeed },
     Callback = function(value)
-        Fly.Speed = value
+        State.Player.FlySpeed = value
     end
 })
 
-PlayerTab:Divider()
+PlayerTab:Space();
 
 PlayerTab:Toggle({
-    Title = "No Clip",
-    Description = "Walk through walls and objects",
-    Default = false,
-    Callback = function(value)
-        Noclip.Enabled = value
-        if value then
-            enableNoclip()
+    Title = "Noclip",
+    Flag = "NoclipToggle",
+    Desc = "Walk through walls (need higher speed)",
+    Value = State.Player.NoclipEnabled,
+    Callback = function(state)
+        State.Player.NoclipEnabled = state
+        if state then
+            NoclipModule.Enable()
+            Success("Noclip Enabled", "You can walk through walls", 2)
         else
-            disableNoclip()
+            NoclipModule.Disable()
+            Success("Noclip Disabled", "Noclip disabled", 2)
+        end
+    end
+})
+
+PlayerTab:Space();
+
+PlayerTab:Toggle({
+    Title = "CFrame Speed Boost",
+    Flag = "CFrameSpeedToggle",
+    Desc = "Movement speed boost",
+    Value = State.Player.SpeedEnabled,
+    Callback = function(state)
+        State.Player.SpeedEnabled = state
+        if state then
+            CFrameSpeedModule.Start()
+            Success("Speed Enabled", "CFrame speed boost activated!", 2)
+        else
+            CFrameSpeedModule.Stop()
+            Success("Speed Disabled", "CFrame speed boost disabled", 2)
+        end
+    end
+})
+
+PlayerTab:Slider({
+    Title = "Speed Value",
+    Flag = "SpeedValueSlider",
+    Value = { Min = 1, Max = 50, Default = State.Player.SpeedValue },
+    Callback = function(value)
+        State.Player.SpeedValue = value
+    end
+})
+
+PlayerTab:Space();
+
+PlayerTab:Toggle({
+    Title = "Jump Boost",
+    Flag = "JumpBoostToggle",
+    Desc = "Enable custom jump power",
+    Value = false,
+    Callback = function(state)
+        if player.Character and player.Character:FindFirstChildOfClass("Humanoid") then
+            player.Character.Humanoid.UseJumpPower = state
+        end
+    end
+})
+
+PlayerTab:Slider({
+    Title = "Jump Power",
+    Flag = "JumpPowerSlider",
+    Value = { Min = 0, Max = 1000, Default = 50 },
+    Callback = function(value)
+        State.Player.JumpPower = value
+        if player.Character and player.Character:FindFirstChildOfClass("Humanoid") then
+            player.Character.Humanoid.JumpPower = value
         end
     end
 })
 
 PlayerTab:Divider()
+PlayerTab:Section({ Title = "Bunny Hop", TextSize = 18 })
 
-PlayerTab:Section({ Title = "Teleport", TextSize = 20 })
-
-local TeleportUI = { PlayerName = nil, Dropdown = nil }
-
-local function getPlayerList()
-    local names = {}
-    for _, pl in pairs(Players:GetPlayers()) do
-        if pl ~= LocalPlayer then
-            table.insert(names, pl.Name)
+PlayerTab:Toggle({
+    Title = "Bunny Hop Hold",
+    Flag = "BhopHoldToggle",
+    Desc = "Hold space to bunny hop",
+    Value = State.Player.BhopHoldEnabled,
+    Callback = function(state)
+        State.Player.BhopHoldEnabled = state
+        if state then
+            BhopModule.Start()
+            Success("Bhop Hold Enabled", "Hold space to bunny hop!", 2)
+        else
+            BhopModule.Stop()
+            Success("Bhop Hold Disabled", "Bhop hold disabled", 2)
         end
     end
-    table.sort(names)
-    return #names > 0 and names or { "No players" }
+})
+
+PlayerTab:Toggle({
+    Title = "Bunny Hop Toggle",
+    Flag = "BhopToggleToggle",
+    Desc = "Auto bunny hop without holding space",
+    Value = State.Player.BhopToggleEnabled,
+    Callback = function(state)
+        State.Player.BhopToggleEnabled = state
+        if state then
+            BhopToggleModule.Start()
+            Success("Bhop Auto Enabled", "Auto bunny hop activated!", 2)
+        else
+            BhopToggleModule.Stop()
+            Success("Bhop Auto Disabled", "Auto bhop disabled", 2)
+        end
+    end
+})
+
+
+-- -------------------------------------------------------------------------- --
+--                                   TAB ESP                                  --
+-- -------------------------------------------------------------------------- --
+
+-- ------------------------------ ESP VARIABLES ----------------------------- --
+
+local NextbotBillboards = {}
+local PlayerBillboards = {}
+local TicketBillboards = {}
+local playerTracerElements = {}
+local botTracerElements = {}
+local nextbotESPLoop = nil
+local playerESPLoop = nil
+local ticketESPLoop = nil
+local playerTracerConnection = nil
+local botTracerConnection = nil
+local nextBotNames = {}
+
+-- -------------------------- ESP HELPER FUNCTIONS -------------------------- --
+
+if ReplicatedStorage:FindFirstChild("NPCs") then
+    for _, npc in ipairs(ReplicatedStorage.NPCs:GetChildren()) do
+        table.insert(nextBotNames, npc.Name)
+    end
+end
+
+local function isNextbotModel(model)
+    if not model or not model.Name then return false end
+    for _, name in ipairs(nextBotNames) do
+        if model.Name == name then return true end
+    end
+    return model.Name:lower():find("nextbot") or
+        model.Name:lower():find("scp") or
+        model.Name:lower():find("monster") or
+        model.Name:lower():find("creep") or
+        model.Name:lower():find("enemy") or
+        model.Name:lower():find("zombie") or
+        model.Name:lower():find("ghost") or
+        model.Name:lower():find("demon")
+end
+
+local function getDistanceFromPlayer(targetPosition)
+    if not player.Character or not player.Character:FindFirstChild("HumanoidRootPart") then
+        return 0
+    end
+    local distance = (targetPosition - player.Character.HumanoidRootPart.Position).Magnitude
+    return math.floor(distance)
+end
+
+function CreateBillboardESP(Name, Part, Color, TextSize)
+    if not Part or Part:FindFirstChild(Name) then return nil end
+
+    local BillboardGui = Instance.new("BillboardGui")
+    local TextLabel = Instance.new("TextLabel")
+    local TextStroke = Instance.new("UIStroke")
+
+    BillboardGui.Parent = Part
+    BillboardGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    BillboardGui.Name = Name
+    BillboardGui.AlwaysOnTop = true
+    BillboardGui.LightInfluence = 1
+    BillboardGui.Size = UDim2.new(0, 200, 0, 50)
+    BillboardGui.StudsOffset = Vector3.new(0, 3, 0)
+    BillboardGui.MaxDistance = 1000
+
+    TextLabel.Parent = BillboardGui
+    TextLabel.BackgroundTransparency = 1
+    TextLabel.Size = UDim2.new(1, 0, 1, 0)
+    TextLabel.TextScaled = false
+    TextLabel.Font = Enum.Font.SourceSansBold
+    TextLabel.TextSize = TextSize or 14
+    TextLabel.TextColor3 = Color or Color3.fromRGB(255, 255, 255)
+
+    TextStroke.Parent = TextLabel
+    TextStroke.Thickness = 2
+    TextStroke.Color = Color3.new(0, 0, 0)
+
+    return BillboardGui
+end
+
+function UpdateBillboardESP(Name, Part, NameText, Color, TextSize)
+    if not Part then return false end
+
+    local esp = Part:FindFirstChild(Name)
+    if esp and esp:FindFirstChildOfClass("TextLabel") then
+        local label = esp:FindFirstChildOfClass("TextLabel")
+
+        if Color then
+            label.TextColor3 = Color
+        end
+
+        if TextSize then
+            label.TextSize = TextSize
+        end
+
+        local distance = getDistanceFromPlayer(Part.Position)
+        local name = NameText or Part.Parent and Part.Parent.Name or Part.Name
+        label.Text = string.format("%s [%dm]", name, distance)
+
+        return true
+    end
+    return false
+end
+
+function DestroyBillboardESP(Name, Part)
+    if not Part then return false end
+
+    local esp = Part:FindFirstChild(Name)
+    if esp then
+        esp:Destroy()
+        return true
+    end
+
+    return false
+end
+
+local function scanForNextbots()
+    local nextbots = {}
+
+    local playersFolder = workspace:FindFirstChild("Players")
+    if playersFolder then
+        for _, model in ipairs(playersFolder:GetChildren()) do
+            if model:IsA("Model") and isNextbotModel(model) then
+                local hrp = model:FindFirstChild("HumanoidRootPart") or model:FindFirstChild("Head")
+                if hrp then
+                    nextbots[model] = hrp
+                end
+            end
+        end
+    end
+
+    local npcsFolder = workspace:FindFirstChild("NPCs")
+    if npcsFolder then
+        for _, model in ipairs(npcsFolder:GetChildren()) do
+            if model:IsA("Model") and isNextbotModel(model) then
+                local hrp = model:FindFirstChild("HumanoidRootPart") or model:FindFirstChild("Head")
+                if hrp then
+                    nextbots[model] = hrp
+                end
+            end
+        end
+    end
+
+    for model, hrp in pairs(nextbots) do
+        if not NextbotBillboards[model] then
+            local esp = CreateBillboardESP("NextbotESP", hrp, Color3.fromRGB(255, 0, 0), 16)
+            if esp then
+                UpdateBillboardESP("NextbotESP", hrp, model.Name, Color3.fromRGB(255, 0, 0), 16)
+                NextbotBillboards[model] = { esp = esp, hrp = hrp }
+            end
+        else
+            UpdateBillboardESP("NextbotESP", hrp, model.Name, Color3.fromRGB(255, 0, 0), 16)
+        end
+    end
+
+    for model, data in pairs(NextbotBillboards) do
+        if not nextbots[model] or not model.Parent then
+            if data.hrp then
+                DestroyBillboardESP("NextbotESP", data.hrp)
+            end
+            NextbotBillboards[model] = nil
+        end
+    end
+end
+
+local function scanForPlayers()
+    for _, plr in pairs(Players:GetPlayers()) do
+        if plr ~= player and plr.Character then
+            local head = plr.Character:FindFirstChild("Head") or plr.Character:FindFirstChild("HumanoidRootPart")
+            if head then
+                if not PlayerBillboards[plr] then
+                    local esp = CreateBillboardESP("PlayerESP", head, Color3.fromRGB(0, 255, 0), 14)
+                    if esp then
+                        UpdateBillboardESP("PlayerESP", head, plr.Name, Color3.fromRGB(0, 255, 0), 14)
+                        PlayerBillboards[plr] = esp
+                    end
+                else
+                    UpdateBillboardESP("PlayerESP", head, plr.Name, Color3.fromRGB(0, 255, 0), 14)
+                end
+            end
+        elseif PlayerBillboards[plr] then
+            if plr.Character then
+                DestroyBillboardESP("PlayerESP",
+                    plr.Character:FindFirstChild("Head") or plr.Character:FindFirstChild("HumanoidRootPart"))
+            end
+            PlayerBillboards[plr] = nil
+        end
+    end
+end
+
+local function scanForTickets()
+    local tickets = workspace.Effects and workspace.Effects:FindFirstChild("Tickets")
+    if tickets then
+        for _, ticket in pairs(tickets:GetChildren()) do
+            if ticket:IsA("BasePart") or ticket:IsA("Model") then
+                local part = ticket:IsA("Model") and ticket:FindFirstChild("Head") or
+                    ticket:IsA("BasePart") and ticket
+                if part then
+                    if not TicketBillboards[ticket] then
+                        local esp = CreateBillboardESP("TicketESP", part, Color3.fromRGB(255, 255, 0), 12)
+                        if esp then
+                            UpdateBillboardESP("TicketESP", part, "Ticket", Color3.fromRGB(255, 255, 0), 12)
+                            TicketBillboards[ticket] = esp
+                        end
+                    else
+                        UpdateBillboardESP("TicketESP", part, "Ticket", Color3.fromRGB(255, 255, 0), 12)
+                    end
+                end
+            end
+        end
+    end
+
+    for ticket, esp in pairs(TicketBillboards) do
+        if not ticket or not ticket.Parent then
+            local part = ticket:IsA("Model") and ticket:FindFirstChild("Head") or ticket
+            if part then
+                DestroyBillboardESP("TicketESP", part)
+            end
+            TicketBillboards[ticket] = nil
+        end
+    end
+end
+
+-- Tracer ESP Functions
+local function createTracerObject()
+    local tracer = Drawing.new("Line")
+    tracer.Visible = false
+    tracer.Thickness = 1
+    tracer.ZIndex = 1
+    return tracer
+end
+
+local function updatePlayerTracers()
+    local camera = workspace.CurrentCamera
+    if not camera then return end
+
+    local screenBottomCenter = Vector2.new(camera.ViewportSize.X / 2, camera.ViewportSize.Y)
+    local currentTargets = {}
+
+    for _, plr in pairs(Players:GetPlayers()) do
+        if plr ~= player and plr.Character then
+            local hrp = plr.Character:FindFirstChild("HumanoidRootPart")
+            if hrp then
+                currentTargets[plr] = true
+
+                if not playerTracerElements[plr] then
+                    playerTracerElements[plr] = createTracerObject()
+                end
+
+                local tracer = playerTracerElements[plr]
+                local vector, onScreen = camera:WorldToViewportPoint(hrp.Position)
+
+                if onScreen then
+                    tracer.Visible = true
+                    tracer.From = screenBottomCenter
+                    tracer.To = Vector2.new(vector.X, vector.Y)
+                    tracer.Color = Color3.fromRGB(0, 255, 0)
+                else
+                    tracer.Visible = false
+                end
+            end
+        end
+    end
+
+    for plr, tracer in pairs(playerTracerElements) do
+        if not currentTargets[plr] then
+            if tracer and tracer.Remove then
+                tracer:Remove()
+            end
+            playerTracerElements[plr] = nil
+        end
+    end
+end
+
+local function updateBotTracers()
+    local camera = workspace.CurrentCamera
+    if not camera then return end
+
+    local screenBottomCenter = Vector2.new(camera.ViewportSize.X / 2, camera.ViewportSize.Y)
+    local currentTargets = {}
+
+    local playersFolder = workspace:FindFirstChild("Players")
+    if playersFolder then
+        for _, model in pairs(playersFolder:GetChildren()) do
+            if model:IsA("Model") and isNextbotModel(model) then
+                local hrp = model:FindFirstChild("HumanoidRootPart")
+                if hrp then
+                    currentTargets[model] = true
+
+                    if not botTracerElements[model] then
+                        botTracerElements[model] = createTracerObject()
+                    end
+
+                    local tracer = botTracerElements[model]
+                    local vector, onScreen = camera:WorldToViewportPoint(hrp.Position)
+
+                    if onScreen then
+                        tracer.Visible = true
+                        tracer.From = screenBottomCenter
+                        tracer.To = Vector2.new(vector.X, vector.Y)
+                        tracer.Color = Color3.fromRGB(255, 0, 0)
+                    else
+                        tracer.Visible = false
+                    end
+                end
+            end
+        end
+    end
+
+    local npcsFolder = workspace:FindFirstChild("NPCs")
+    if npcsFolder then
+        for _, model in pairs(npcsFolder:GetChildren()) do
+            if model:IsA("Model") and isNextbotModel(model) then
+                local hrp = model:FindFirstChild("HumanoidRootPart")
+                if hrp then
+                    currentTargets[model] = true
+
+                    if not botTracerElements[model] then
+                        botTracerElements[model] = createTracerObject()
+                    end
+
+                    local tracer = botTracerElements[model]
+                    local vector, onScreen = camera:WorldToViewportPoint(hrp.Position)
+
+                    if onScreen then
+                        tracer.Visible = true
+                        tracer.From = screenBottomCenter
+                        tracer.To = Vector2.new(vector.X, vector.Y)
+                        tracer.Color = Color3.fromRGB(255, 0, 0)
+                    else
+                        tracer.Visible = false
+                    end
+                end
+            end
+        end
+    end
+
+    for model, tracer in pairs(botTracerElements) do
+        if not currentTargets[model] then
+            if tracer and tracer.Remove then
+                tracer:Remove()
+            end
+            botTracerElements[model] = nil
+        end
+    end
+end
+
+local function startPlayerTracers()
+    if playerTracerConnection then return end
+    playerTracerConnection = RunService.RenderStepped:Connect(updatePlayerTracers)
+end
+
+local function stopPlayerTracers()
+    if playerTracerConnection then
+        playerTracerConnection:Disconnect()
+        playerTracerConnection = nil
+    end
+    for plr, tracer in pairs(playerTracerElements) do
+        if tracer and tracer.Remove then
+            tracer:Remove()
+        end
+    end
+    playerTracerElements = {}
+end
+
+local function startBotTracers()
+    if botTracerConnection then return end
+    botTracerConnection = RunService.RenderStepped:Connect(updateBotTracers)
+end
+
+local function stopBotTracers()
+    if botTracerConnection then
+        botTracerConnection:Disconnect()
+        botTracerConnection = nil
+    end
+    for model, tracer in pairs(botTracerElements) do
+        if tracer and tracer.Remove then
+            tracer:Remove()
+        end
+    end
+    botTracerElements = {}
+end
+
+local ESPTab = Window:Tab({ Icon = "eye", Title = "ESP" })
+
+ESPTab:Section({ Title = "Billboard ESP", TextSize = 20 })
+ESPTab:Divider()
+
+ESPTab:Toggle({
+    Title = "Nextbots ESP",
+    Flag = "NextbotsESPToggle",
+    Desc = "Show nextbots with distance",
+    Value = false,
+    Callback = function(state)
+        if state then
+            if not nextbotESPLoop then
+                nextbotESPLoop = RunService.RenderStepped:Connect(function()
+                    scanForNextbots()
+                end)
+            end
+        else
+            if nextbotESPLoop then
+                nextbotESPLoop:Disconnect()
+                nextbotESPLoop = nil
+            end
+
+            for model, data in pairs(NextbotBillboards) do
+                if data.hrp then
+                    DestroyBillboardESP("NextbotESP", data.hrp)
+                end
+            end
+            NextbotBillboards = {}
+        end
+    end
+})
+
+ESPTab:Toggle({
+    Title = "Players ESP",
+    Flag = "PlayersESPToggle",
+    Desc = "Show players with distance",
+    Value = false,
+    Callback = function(state)
+        if state then
+            if not playerESPLoop then
+                playerESPLoop = RunService.RenderStepped:Connect(function()
+                    scanForPlayers()
+                end)
+            end
+        else
+            if playerESPLoop then
+                playerESPLoop:Disconnect()
+                playerESPLoop = nil
+            end
+
+            for plr, esp in pairs(PlayerBillboards) do
+                if plr.Character then
+                    DestroyBillboardESP("PlayerESP",
+                        plr.Character:FindFirstChild("Head") or plr.Character:FindFirstChild("HumanoidRootPart"))
+                end
+            end
+            PlayerBillboards = {}
+        end
+    end
+})
+
+ESPTab:Toggle({
+    Title = "Tickets ESP",
+    Flag = "TicketsESPToggle",
+    Desc = "Show summer event tickets with distance",
+    Value = false,
+    Callback = function(state)
+        if state then
+            if not ticketESPLoop then
+                ticketESPLoop = RunService.RenderStepped:Connect(function()
+                    scanForTickets()
+                end)
+            end
+        else
+            if ticketESPLoop then
+                ticketESPLoop:Disconnect()
+                ticketESPLoop = nil
+            end
+
+            for ticket, esp in pairs(TicketBillboards) do
+                local part = ticket:IsA("Model") and ticket:FindFirstChild("Head") or ticket
+                if part then
+                    DestroyBillboardESP("TicketESP", part)
+                end
+            end
+            TicketBillboards = {}
+        end
+    end
+})
+
+ESPTab:Divider()
+ESPTab:Section({ Title = "Tracer ESP", TextSize = 20 })
+ESPTab:Divider()
+
+ESPTab:Toggle({
+    Title = "Tracer Players",
+    Flag = "TracerPlayersToggle",
+    Desc = "Draw lines to players",
+    Value = false,
+    Callback = function(state)
+        if state then
+            startPlayerTracers()
+        else
+            stopPlayerTracers()
+        end
+    end
+})
+
+ESPTab:Toggle({
+    Title = "Tracer Nextbots",
+    Flag = "TracerNextbotsToggle",
+    Desc = "Draw lines to nextbots",
+    Value = false,
+    Callback = function(state)
+        if state then
+            startBotTracers()
+        else
+            stopBotTracers()
+        end
+    end
+})
+
+-- -------------------------------------------------------------------------- --
+--                               TAB AUTOMATION                               --
+-- -------------------------------------------------------------------------- --
+
+-- ---------------------------- VOTING FUNCTIONS ---------------------------- --
+
+local selectedMapNumber = 1
+local selectedGameMode = 1
+local autoVoteEnabled = false
+local autoVoteModeEnabled = false
+local voteConnection = nil
+local voteModeConnection = nil
+
+local function fireVoteServer(number, isMode)
+    local voteEvent = ReplicatedStorage.Events:FindFirstChild("Vote")
+    if voteEvent then
+        if voteEvent and typeof(voteEvent) == "Instance" and voteEvent:IsA("RemoteEvent") then
+            if isMode then
+                voteEvent:FireServer(number, true)
+            else
+                voteEvent:FireServer(number)
+            end
+        end
+    end
+end
+
+-- --------------------------- AUTO FARM MODULE --------------------------- --
+
+
+local AutoFarmModule = (function()
+    local securityPart = nil
+    local connections = {
+        autoWin = nil,
+        farmTickets = nil
+    }
+    local activeStates = {
+        autoWin = false,
+        farmTickets = false
+    }
+
+    -- Shared helper: Create security platform
+    local function createSecurityPart()
+        if workspace:FindFirstChild("SecurityPart") then
+            return workspace.SecurityPart
+        end
+
+        securityPart = Instance.new("Part")
+        securityPart.Name = "SecurityPart"
+        securityPart.Size = Vector3.new(10, 1, 10)
+        securityPart.Position = Vector3.new(5000, 5000, 5000)
+        securityPart.Anchored = true
+        securityPart.CanCollide = true
+        securityPart.Transparency = 0.9
+        securityPart.Material = Enum.Material.Neon
+        securityPart.BrickColor = BrickColor.new("Bright green")
+        securityPart.Parent = workspace
+
+        return securityPart
+    end
+
+    -- Shared helper: Remove security platform if no farms active
+    local function removeSecurityPart()
+        if not activeStates.autoWin and not activeStates.farmTickets then
+            if securityPart and securityPart.Parent then
+                securityPart:Destroy()
+            end
+            securityPart = nil
+        end
+    end
+
+    local farmCS = nil
+    local function getFarmCS()
+        if farmCS then return farmCS end
+        pcall(function() farmCS = require(ReplicatedStorage.Services.Asset.CharacterService) end)
+        return farmCS
+    end
+
+    -- Shared helper: Check if player is downed
+    local function isPlayerDowned(pl)
+        if not pl or not pl.Character then return false end
+        local cs = getFarmCS()
+        if cs then
+            local charData = cs:GetCharacterFromPlayer(pl)
+            if charData and charData.DataRegistry:Get("Downed") then
+                return true
+            end
+        end
+        local hum = pl.Character:FindFirstChild("Humanoid")
+        if hum and hum.Health <= 0 then return true end
+        return false
+    end
+
+    -- Shared helper: Get player from character model
+    local function getPlayerFromModel(model)
+        for _, pl in pairs(Players:GetPlayers()) do
+            if pl.Character == model or (pl.Character and pl.Character.Name == model.Name) then
+                return pl
+            end
+        end
+        return nil
+    end
+
+    -- ---------- FARM TYPE: AUTO WIN ----------
+    local function startAutoWin()
+        if connections.autoWin then return end
+
+        local security = createSecurityPart()
+        activeStates.autoWin = true
+
+        connections.autoWin = task.spawn(function()
+            while activeStates.autoWin do
+                local secPart = workspace:FindFirstChild("SecurityPart")
+                if not secPart then break end
+
+                local char = player.Character
+                if char then
+                    local hrp = char:FindFirstChild("HumanoidRootPart")
+                    if hrp then
+                        local cs = getFarmCS()
+                        local isDown = false
+                        if cs then
+                            local charData = cs:GetCharacterFromPlayer(player)
+                            isDown = charData and charData.DataRegistry:Get("Downed")
+                        end
+                        if not isDown then
+                            hrp.CFrame = secPart.CFrame + Vector3.new(0, 3, 0)
+                        end
+                    end
+                end
+
+                task.wait(0.1)
+            end
+        end)
+    end
+
+    local function stopAutoWin()
+        activeStates.autoWin = false
+        if connections.autoWin then
+            task.cancel(connections.autoWin)
+            connections.autoWin = nil
+        end
+        removeSecurityPart()
+    end
+
+
+    -- ---------- FARM TYPE: FARM TICKETS ----------
+    local function startFarmTickets()
+        if connections.farmTickets then return end
+
+        local security = createSecurityPart()
+        activeStates.farmTickets = true
+
+        local yOffset = 15
+        local currentTicket = nil
+        local ticketProcessedTime = 0
+
+        connections.farmTickets = RunService.Heartbeat:Connect(function()
+            local secPart = workspace:FindFirstChild("SecurityPart")
+            if not secPart then return end
+
+            local char = player.Character
+            if not char then return end
+
+            local hrp = char:FindFirstChild("HumanoidRootPart")
+            if not hrp then return end
+
+            local effects = workspace.Effects
+            if effects then
+                local tickets = effects:FindFirstChild("Tickets")
+                if tickets and #tickets:GetChildren() > 0 then
+                    if not currentTicket or not currentTicket.Parent then
+                        local closestTicket = nil
+                        local closestDist = math.huge
+
+                        for _, ticket in pairs(tickets:GetChildren()) do
+                            local ticketPos = ticket:IsA("Model") and ticket:GetPivot().Position or ticket.Position
+                            local dist = (hrp.Position - ticketPos).Magnitude
+                            if dist < closestDist then
+                                closestDist = dist
+                                closestTicket = ticket
+                            end
+                        end
+
+                        currentTicket = closestTicket
+                        ticketProcessedTime = tick()
+                    end
+
+                    if currentTicket and currentTicket.Parent then
+                        local ticketPart = currentTicket:IsA("Model") and
+                            (currentTicket:FindFirstChild("Root") or currentTicket.PrimaryPart) or currentTicket
+                        if ticketPart then
+                            local targetPosition = ticketPart.Position + Vector3.new(0, yOffset, 0)
+                            hrp.CFrame = CFrame.new(targetPosition)
+
+                            if tick() - ticketProcessedTime > 0.1 then
+                                hrp.CFrame = ticketPart.CFrame
+                            end
+                        else
+                            currentTicket = nil
+                        end
+                    else
+                        hrp.CFrame = secPart.CFrame + Vector3.new(0, 3, 0)
+                        currentTicket = nil
+                    end
+                else
+                    hrp.CFrame = secPart.CFrame + Vector3.new(0, 3, 0)
+                    currentTicket = nil
+                end
+            else
+                hrp.CFrame = secPart.CFrame + Vector3.new(0, 3, 0)
+                currentTicket = nil
+            end
+        end)
+    end
+
+    local function stopFarmTickets()
+        activeStates.farmTickets = false
+        if connections.farmTickets then
+            connections.farmTickets:Disconnect()
+            connections.farmTickets = nil
+        end
+        removeSecurityPart()
+    end
+
+    -- Public API
+    return {
+        StartAutoWin = startAutoWin,
+        StopAutoWin = stopAutoWin,
+        StartFarmTickets = startFarmTickets,
+        StopFarmTickets = stopFarmTickets,
+        StopAll = function()
+            stopAutoWin()
+            stopFarmTickets()
+        end
+    }
+end)()
+
+-- ----------------------------- VIP MENU MODULE ---------------------------- --
+
+local VipMenuModule = (function()
+    local autoSpecialRoundEnabled = false
+    local specialRoundName = "Plushie Hell"
+    local lastRoundsCompleted = 0
+
+    local function setSpecialRound(roundName)
+        if not roundName or roundName == "" then
+            Error("Special Round Failed", "Please enter a special round name!", 2)
+            return
+        end
+
+        task.spawn(function()
+            local success, err = pcall(function()
+                local args = {
+                    [1] = "!specialround " .. roundName
+                }
+                game:GetService("ReplicatedStorage"):WaitForChild("Events"):WaitForChild("Admin"):WaitForChild("Command")
+                    :InvokeServer(unpack(args))
+            end)
+
+            if success then
+                print("[SpecialRound] Set to:", roundName)
+            else
+                warn("[SpecialRound] Failed:", err)
+            end
+        end)
+    end
+
+    -- Hook UpdateServerStateRegistry buat detect round changes
+    local lastVoting = nil
+    local lastLoading = nil
+
+    local stateRegistry = ReplicatedStorage.Events:FindFirstChild("UpdateServerStateRegistry")
+    if stateRegistry then
+        stateRegistry.OnClientEvent:Connect(function(stateData)
+            if not autoSpecialRoundEnabled then return end
+            if not stateData or type(stateData) ~= "table" then return end
+
+            -- RoundStarted: false = round ended, true = round started
+            if stateData.RoundStarted == false and lastRoundsCompleted ~= (stateData.RoundsCompleted or 0) then
+                lastRoundsCompleted = stateData.RoundsCompleted or 0
+                task.spawn(function()
+                    task.wait(2)
+                    setSpecialRound(specialRoundName)
+                    Success("Auto Special Round", "Special round set for this round!", 2)
+                end)
+            end
+
+            -- Voting: false = voting ended / map loaded
+            if stateData.Voting == false and lastVoting ~= false then
+                task.spawn(function()
+                    local loadWaitTime = 0
+                    repeat
+                        task.wait(0.5)
+                        loadWaitTime = loadWaitTime + 0.5
+                    until (not (stateData.Loading == true) and not (stateData.MapLoading == true)) or loadWaitTime > 15
+
+                    local character = player.Character or player.CharacterAdded:Wait()
+                    character:WaitForChild("HumanoidRootPart")
+                    task.wait(2)
+                    setSpecialRound(specialRoundName)
+                    Success("Auto Special Round", "Special round set for new map!", 2)
+                end)
+            end
+
+            lastVoting = stateData.Voting
+            lastLoading = stateData.Loading
+        end)
+    end
+
+    -- Public API
+    return {
+        SetSpecialRound = setSpecialRound,
+        SetAutoEnabled = function(enabled)
+            autoSpecialRoundEnabled = enabled
+        end,
+        GetSpecialRoundName = function()
+            return specialRoundName
+        end,
+        SetSpecialRoundName = function(name)
+            specialRoundName = name
+        end
+    }
+end)()
+
+-- -------------------------------------------------------------------------- --
+--                         AUTO SELF REVIVE MODULE                           --
+-- -------------------------------------------------------------------------- --
+
+local AutoSelfReviveModule = (function()
+    local enabled = false
+    local method = "Spawnpoint" -- "Spawnpoint" or "Fake Revive"
+    local connections = {}      -- { Heartbeat, Character }
+    local lastSavedPosition = nil
+    local hasRevived = false
+    local isReviving = false
+
+    local CharacterService = nil
+    local function getCharacterService()
+        if CharacterService then return CharacterService end
+        local ok, result = pcall(function()
+            return require(ReplicatedStorage.Services.Asset.CharacterService)
+        end)
+        if ok then CharacterService = result end
+        return CharacterService
+    end
+
+    local function isPlayerDowned()
+        local char = player.Character
+        if not char then return false end
+        local cs = getCharacterService()
+        if not cs then return false end
+        local charData = cs:GetCharacterFromPlayer(player)
+        return charData and charData.DataRegistry:Get("Downed") or false
+    end
+
+    local function revive()
+        local char = player.Character
+        if not char or isReviving then return end
+        if not isPlayerDowned() then return end
+
+        isReviving = true
+
+        if method == "Spawnpoint" then
+            if not hasRevived then
+                hasRevived = true
+                pcall(function()
+                    ReplicatedStorage.Events.SetPlayerMode:FireServer(true)
+                end)
+                Success("Auto Self Revive", "Reviving at spawnpoint...", 2)
+                task.delay(10, function()
+                    hasRevived = false
+                end)
+                task.delay(1, function()
+                    isReviving = false
+                end)
+            else
+                isReviving = false
+            end
+        elseif method == "Fake Revive" then
+            local hrp = char:FindFirstChild("HumanoidRootPart")
+            local savedPos = hrp and hrp.Position
+
+            task.spawn(function()
+                pcall(function()
+                    ReplicatedStorage.Events.SetPlayerMode:FireServer(true)
+                end)
+                Success("Auto Self Revive", "Saving position and reviving...", 2)
+
+                local newCharacter
+                repeat
+                    newCharacter = player.Character
+                    task.wait()
+                until newCharacter and newCharacter:FindFirstChild("HumanoidRootPart") and newCharacter ~= char
+
+                if newCharacter and savedPos then
+                    local newHRP = newCharacter:FindFirstChild("HumanoidRootPart")
+                    if newHRP then
+                        task.wait(0.1)
+                        newHRP.CFrame = CFrame.new(savedPos)
+                        Success("Auto Self Revive", "Teleported back to saved position!", 2)
+                    end
+                end
+                isReviving = false
+            end)
+        end
+    end
+
+    local function start()
+        if connections.Heartbeat then return end
+        enabled = true
+
+        connections.Heartbeat = RunService.Heartbeat:Connect(function()
+            if not enabled then return end
+            if isPlayerDowned() then
+                revive()
+            end
+        end)
+
+        connections.Character = player.CharacterAdded:Connect(function(newChar)
+            hasRevived = false
+            isReviving = false
+            lastSavedPosition = nil
+        end)
+
+        Success("Auto Self Revive", "Enabled with method: " .. method, 2)
+    end
+
+    local function stop()
+        enabled = false
+        hasRevived = false
+        isReviving = false
+        lastSavedPosition = nil
+
+        for name, conn in pairs(connections) do
+            if conn then
+                conn:Disconnect()
+                connections[name] = nil
+            end
+        end
+        Info("Auto Self Revive", "Disabled", 2)
+    end
+
+    return {
+        Start = start,
+        Stop = stop,
+        SetMethod = function(newMethod)
+            method = newMethod
+            if enabled then
+                Info("Auto Self Revive", "Method changed to: " .. newMethod, 2)
+            end
+        end,
+        IsEnabled = function()
+            return enabled
+        end
+    }
+end)()
+
+-- -------------------------------------------------------------------------- --
+--                      AUTO RESPAWN WATCH AD MODULE                          --
+-- -------------------------------------------------------------------------- --
+
+local AutoRespawnWatchAd = (function()
+    local enabled = false
+    local monitorConnection = nil
+    local lastKnownState = true
+
+    local function checkPlayerAlive()
+        local gamePlayers = workspace:FindFirstChild("Players")
+        if gamePlayers then
+            local ourChar = gamePlayers:FindFirstChild(player.Name)
+            return ourChar ~= nil
+        end
+        return true
+    end
+
+    local function start()
+        if enabled then return end
+        enabled = true
+        monitorConnection = RunService.Heartbeat:Connect(function()
+            local isAlive = checkPlayerAlive()
+            if lastKnownState == true and isAlive == false then
+                Success("Auto Respawn", "Death detected! Watching ad to respawn...", 2)
+                task.spawn(function()
+                    pcall(function()
+                        ReplicatedStorage:WaitForChild("RequestShowAdEvent"):FireServer()
+                    end)
+                end)
+            end
+
+            lastKnownState = isAlive
+        end)
+
+        Success("Auto Respawn Watch Ad", "Enabled - will auto respawn on death", 2)
+    end
+
+    local function stop()
+        if not enabled then return end
+        enabled = false
+
+        if monitorConnection then
+            monitorConnection:Disconnect()
+            monitorConnection = nil
+        end
+
+        lastKnownState = true
+        Info("Auto Respawn Watch Ad", "Disabled", 2)
+    end
+
+    return {
+        Start = start,
+        Stop = stop,
+        IsEnabled = function()
+            return enabled
+        end
+    }
+end)()
+
+-- -------------------------------------------------------------------------- --
+--                              AUTO CARRY                                   --
+-- -------------------------------------------------------------------------- --
+local AutoCarryModule = (function()
+    local enabled = false
+    local connection = nil
+    local lastAttempt = 0
+    local lastRelease = 0
+    local wasCarrying = false
+    local releasePause = 8
+    local buttonGui = nil
+    local button = nil
+    local CharacterService = nil
+
+    local function getCharacterService()
+        if CharacterService then return CharacterService end
+        local ok, result = pcall(function()
+            return require(ReplicatedStorage.Services.Asset.CharacterService)
+        end)
+        if ok then CharacterService = result end
+        return CharacterService
+    end
+
+    local function isDowned(target)
+        local service = getCharacterService()
+        local data = service and service:GetCharacterFromPlayer(target)
+        return data and data.DataRegistry and data.DataRegistry:Get("Downed") == true
+    end
+
+    local function isRagdolled(target)
+        local character = target.Character
+        if not character then return true end
+        if character:FindFirstChild("RagdollConstraints") then return true end
+        local service = getCharacterService()
+        local data = service and service:GetCharacterFromPlayer(target)
+        return data and data.DataRegistry and data.DataRegistry:Get("Ragdolling") == true
+    end
+
+    local function isCarrying()
+        local service = getCharacterService()
+        local data = service and service:GetCharacterFromPlayer(player)
+        local state = data and data.Movement and data.Movement.State
+        return state == "Carry" or state == "CarrySlide" or state == "CarrySlideAir"
+            or state == "CarryAir" or state == "Carried" or state == "CarryMove" or state == "CarryIdle"
+    end
+
+    local function start()
+        if connection then return end
+        enabled = true
+        connection = RunService.Heartbeat:Connect(function()
+            if not enabled then return end
+            if isCarrying() then
+                wasCarrying = true
+                return
+            end
+            if wasCarrying then
+                wasCarrying = false
+                lastRelease = os.clock()
+                return
+            end
+            if os.clock() - lastRelease < releasePause then return end
+            local character = player.Character
+            local root = character and character:FindFirstChild("HumanoidRootPart")
+            if not root or os.clock() - lastAttempt < 0.5 then return end
+
+            for _, target in ipairs(Players:GetPlayers()) do
+                if target ~= player and isDowned(target) and not isRagdolled(target) then
+                    local targetCharacter = target.Character
+                    local targetRoot = targetCharacter and targetCharacter:FindFirstChild("HumanoidRootPart")
+                    local tag = targetCharacter and targetCharacter:GetAttribute("Tag")
+                    if targetRoot and tag and (root.Position - targetRoot.Position).Magnitude <= 20 then
+                        local interact = ReplicatedStorage:FindFirstChild("Events")
+                            and ReplicatedStorage.Events:FindFirstChild("Interact")
+                        if interact then pcall(interact.FireServer, interact, "Carry", tag) end
+                        lastAttempt = os.clock()
+                        break
+                    end
+                end
+            end
+        end)
+    end
+
+    local function stop()
+        enabled = false
+        wasCarrying = false
+        if connection then connection:Disconnect(); connection = nil end
+    end
+
+    local module = {
+        Start = start,
+        Stop = stop,
+        SetReleasePause = function(value) releasePause = value end,
+        IsEnabled = function() return enabled end,
+    }
+
+    function module:SetButtonVisible(visible, toggle)
+        if not UserInputService.TouchEnabled then return end
+        if not visible then
+            if buttonGui then buttonGui:Destroy(); buttonGui = nil; button = nil end
+            return
+        end
+        if buttonGui then return end
+        buttonGui = Instance.new("ScreenGui")
+        buttonGui.Name = "BagahHubAutoCarry"
+        buttonGui.ResetOnSpawn = false
+        buttonGui.DisplayOrder = 999
+        buttonGui.Parent = PlayerGui
+        button = Instance.new("TextButton")
+        button.Name = "Toggle"
+        button.AnchorPoint = Vector2.new(0.5, 0.5)
+        button.Position = UDim2.new(0.82, 0, 0.7, 0)
+        button.Size = UDim2.fromOffset(128, 42)
+        button.BackgroundColor3 = Color3.fromRGB(54, 45, 20)
+        button.TextColor3 = Color3.fromRGB(250, 204, 21)
+        button.Font = Enum.Font.GothamBold
+        button.TextSize = 14
+        button.Text = "AUTO CARRY: OFF"
+        button.Parent = buttonGui
+        Instance.new("UICorner", button).CornerRadius = UDim.new(0, 8)
+        local dragInput, dragStart, startPosition
+        local moved = false
+        local suppressClick = false
+        button.InputBegan:Connect(function(input)
+            if input.UserInputType ~= Enum.UserInputType.Touch then return end
+            dragInput = input
+            dragStart = input.Position
+            startPosition = button.Position
+            moved = false
+        end)
+        local dragConnection = UserInputService.InputChanged:Connect(function(input)
+            if input ~= dragInput then return end
+            local delta = input.Position - dragStart
+            if delta.Magnitude > 8 then moved = true end
+            button.Position = UDim2.new(startPosition.X.Scale, startPosition.X.Offset + delta.X,
+                startPosition.Y.Scale, startPosition.Y.Offset + delta.Y)
+        end)
+        local endConnection = UserInputService.InputEnded:Connect(function(input)
+            if input == dragInput then
+                dragInput = nil
+                suppressClick = moved
+            end
+        end)
+        buttonGui.Destroying:Connect(function()
+            dragConnection:Disconnect()
+            endConnection:Disconnect()
+        end)
+        button.Activated:Connect(function()
+            if suppressClick then
+                suppressClick = false
+                return
+            end
+            toggle:Set(not module.IsEnabled())
+        end)
+    end
+
+    function module:UpdateButton()
+        if button then
+            button.Text = self.IsEnabled() and "AUTO CARRY: ON" or "AUTO CARRY: OFF"
+            button.BackgroundColor3 = self.IsEnabled() and Color3.fromRGB(105, 85, 20) or Color3.fromRGB(54, 45, 20)
+        end
+    end
+
+    return module
+end)()
+
+
+-- -------------------------- UI TAB AUTOMATION --------------------------- --
+
+local AutoTab = Window:Tab({
+    Icon = "zap",
+    Title = "Auto"
+})
+
+AutoTab:Section({ Title = "Map Voting", TextSize = 20 })
+AutoTab:Divider()
+
+AutoTab:Dropdown({
+    Title = "Select Map",
+    Flag = "MapDropdown",
+    Values = { "Map 1", "Map 2", "Map 3", "Map 4" },
+    Value = "Map 1",
+    Callback = function(option)
+        if option == "Map 1" then
+            selectedMapNumber = 1
+        elseif option == "Map 2" then
+            selectedMapNumber = 2
+        elseif option == "Map 3" then
+            selectedMapNumber = 3
+        elseif option == "Map 4" then
+            selectedMapNumber = 4
+        end
+    end
+})
+
+AutoTab:Button({
+    Title = "Vote Map",
+    Flag = "VoteButton",
+    Icon = "check-circle",
+    Callback = function()
+        fireVoteServer(selectedMapNumber)
+    end
+})
+
+AutoTab:Toggle({
+    Title = "Auto Vote",
+    Flag = "AutoVoteToggle",
+    Desc = "Automatically vote for selected map",
+    Value = false,
+    Callback = function(state)
+        autoVoteEnabled = state
+        if autoVoteEnabled then
+            if not voteConnection then
+                voteConnection = task.spawn(function()
+                    while autoVoteEnabled do
+                        fireVoteServer(selectedMapNumber, false)
+                        task.wait(1) -- Vote setiap 1 detik, bukan setiap frame
+                    end
+                end)
+            end
+        else
+            if voteConnection then
+                task.cancel(voteConnection)
+                voteConnection = nil
+            end
+        end
+    end
+})
+
+AutoTab:Divider()
+
+AutoTab:Dropdown({
+    Title = "Select Game Mode",
+    Flag = "GameModeDropdown",
+    Values = { "Mode 1", "Mode 2", "Mode 3", "Mode 4" },
+    Value = "Mode 1",
+    Callback = function(option)
+        if option == "Mode 1" then
+            selectedGameMode = 1
+        elseif option == "Mode 2" then
+            selectedGameMode = 2
+        elseif option == "Mode 3" then
+            selectedGameMode = 3
+        elseif option == "Mode 4" then
+            selectedGameMode = 4
+        end
+    end
+})
+
+AutoTab:Toggle({
+    Title = "Auto Vote Game Mode",
+    Flag = "AutoVoteModeToggle",
+    Desc = "Automatically vote for selected game mode",
+    Value = false,
+    Callback = function(state)
+        autoVoteModeEnabled = state
+        if autoVoteModeEnabled then
+            if not voteModeConnection then
+                voteModeConnection = task.spawn(function()
+                    while autoVoteModeEnabled do
+                        fireVoteServer(selectedGameMode, true)
+                        task.wait(1) -- Vote setiap 1 detik
+                    end
+                end)
+            end
+        else
+            if voteModeConnection then
+                task.cancel(voteModeConnection)
+                voteModeConnection = nil
+            end
+        end
+    end
+})
+
+
+AutoTab:Section({ Title = "Revive", TextSize = 20 })
+AutoTab:Divider()
+
+
+
+AutoTab:Button({
+    Title = "Revive Yourself",
+    Flag = "ReviveButton",
+    Icon = "heart",
+    Callback = function()
+        pcall(function()
+            local CharacterService = require(ReplicatedStorage.Services.Asset.CharacterService)
+            local charData = CharacterService:GetCharacterFromPlayer(player)
+            local isDowned = charData and charData.DataRegistry:Get("Downed")
+            if isDowned then
+                ReplicatedStorage.Events.SetPlayerMode:FireServer(true)
+                Success("Revive", "Revived!", 2)
+            else
+                Info("Revive", "You are not downed!", 2)
+            end
+        end)
+    end
+})
+
+AutoTab:Space()
+
+AutoTab:Dropdown({
+    Title = "Self Revive Method",
+    Flag = "SelfReviveMethodDropdown",
+    Values = { "Spawnpoint", "Fake Revive" },
+    Value = "Spawnpoint",
+    Callback = function(value)
+        AutoSelfReviveModule.SetMethod(value)
+    end
+})
+
+AutoTab:Toggle({
+    Title = "Auto Self Revive",
+    Flag = "AutoSelfReviveToggle",
+    Desc = "Automatically revive yourself when downed",
+    Value = false,
+    Callback = function(state)
+        if state then
+            AutoSelfReviveModule.Start()
+        else
+            AutoSelfReviveModule.Stop()
+        end
+    end
+})
+
+AutoTab:Space()
+
+AutoTab:Toggle({
+    Title = "Auto Respawn Watch Ad",
+    Flag = "AutoRespawnWatchAdToggle",
+    Desc = "Auto watch ad to respawn when you die",
+    Value = false,
+    Callback = function(state)
+        if state then
+            AutoRespawnWatchAd.Start()
+        else
+            AutoRespawnWatchAd.Stop()
+        end
+    end
+})
+
+AutoTab:Space()
+
+AutoTab:Section({ Title = "Carry", TextSize = 20 })
+
+local AutoCarryToggle = AutoTab:Toggle({
+    Title = "Auto Carry",
+    Flag = "AutoCarryToggle",
+    Desc = "Carry nearby downed players",
+    Value = false,
+    Callback = function(state)
+        if state then
+            AutoCarryModule.Start()
+        else
+            AutoCarryModule.Stop()
+        end
+        AutoCarryModule:UpdateButton()
+    end
+})
+
+AutoTab:Slider({
+    Title = "Carry Release Pause (s)",
+    Flag = "AutoCarryReleasePause",
+    Desc = "Wait after releasing a carry before auto carrying again",
+    Value = { Min = 0, Max = 15, Default = 8, Step = 1 },
+    Callback = function(value)
+        AutoCarryModule.SetReleasePause(value)
+    end
+})
+
+AutoTab:Toggle({
+    Title = "Show Carry Button",
+    Flag = "ShowAutoCarryButton",
+    Desc = "Mobile-only on-screen shortcut for Auto Carry",
+    Value = false,
+    Callback = function(state)
+        AutoCarryModule:SetButtonVisible(state, AutoCarryToggle)
+    end
+})
+
+AutoTab:Divider()
+AutoTab:Section({ Title = "Auto Farming", TextSize = 20 })
+AutoTab:Divider()
+
+AutoTab:Toggle({
+    Title = "Auto Win",
+    Flag = "AutoWinToggle",
+    Desc = "Stay at security part to avoid bots and win",
+    Value = false,
+    Callback = function(state)
+        if state then
+            AutoFarmModule.StartAutoWin()
+            Success("Auto Win", "Farming wins at safe zone!", 2)
+        else
+            AutoFarmModule.StopAutoWin()
+            Success("Auto Win", "Stopped auto win", 2)
+        end
+    end
+})
+
+
+AutoTab:Toggle({
+    Title = "Auto Farm Tickets",
+    Flag = "AutoFarmTicketsToggle",
+    Desc = "Collect tickets Event",
+    Value = false,
+    Callback = function(state)
+        if state then
+            AutoFarmModule.StartFarmTickets()
+            Success("Auto Farm Tickets", "Collecting event tickets!", 2)
+        else
+            AutoFarmModule.StopFarmTickets()
+            Success("Auto Farm Tickets", "Stopped ticket farming", 2)
+        end
+    end
+})
+
+
+AutoTab:Divider()
+AutoTab:Section({ Title = "VIP MENU", TextSize = 20 })
+AutoTab:Divider()
+
+
+AutoTab:Input({
+    Title = "Special Round Name",
+    Flag = "SpecialRoundNameInput",
+    Placeholder = "e.g., Plushie Hell",
+    Value = VipMenuModule.GetSpecialRoundName(),
+    Callback = function(value)
+        VipMenuModule.SetSpecialRoundName(value)
+    end
+})
+
+AutoTab:Button({
+    Title = "Set Special Round",
+    Flag = "SetSpecialRoundButton",
+    Desc = "Manually set special round now",
+    Icon = "zap",
+    Callback = function()
+        local roundName = VipMenuModule.GetSpecialRoundName()
+        if roundName == "" then
+            Error("Special Round", "Please enter a special round name first!", 2)
+            return
+        end
+
+        VipMenuModule.SetSpecialRound(roundName)
+        Success("Special Round", "Setting special round: " .. roundName, 2)
+    end
+})
+
+AutoTab:Toggle({
+    Title = "Auto Special Round",
+    Flag = "AutoSpecialRoundToggle",
+    Desc = "Automatically set special round every new round",
+    Value = false,
+    Callback = function(state)
+        VipMenuModule.SetAutoEnabled(state)
+        if state then
+            Success("Auto Special Round Enabled",
+                "Will set '" .. VipMenuModule.GetSpecialRoundName() .. "' on each new round", 3)
+        end
+    end
+})
+
+-- -------------------------------------------------------------------------- --
+--                                 TAB VISUALS                                --
+-- -------------------------------------------------------------------------- --
+-- ----------------------------- COSMETIC MODULE ---------------------------- --
+
+local CosmeticModule = (function()
+    -- Private Variables
+    local headlessEnabled = false
+    local korbloxEnabled = false
+    local loopFakeBundleConnection = nil
+    local loopFakeBundleEnabled = false
+
+    local headMeshId = "134082579"
+    local headTextureId = "134082627"
+    local korbloxMeshId = "101851696"
+    local korbloxTextureId = "101851254"
+
+    -- Private Functions
+    local function applyHeadless()
+        local char = player.Character
+        if not char then return end
+
+        local head = char:FindFirstChild("Head")
+        if not head then return end
+
+        for _, child in pairs(head:GetChildren()) do
+            if child:IsA("Decal") or child:IsA("SpecialMesh") then
+                child:Destroy()
+            end
+        end
+
+        local mesh = Instance.new("SpecialMesh")
+        mesh.MeshType = Enum.MeshType.FileMesh
+        mesh.MeshId = "rbxassetid://" .. headMeshId
+        mesh.TextureId = "rbxassetid://" .. headTextureId
+        mesh.Scale = Vector3.new(1.25, 1.25, 1.25)
+        mesh.Offset = Vector3.new(0, 0, 0)
+        mesh.Parent = head
+
+        head.Transparency = 0.1
+        head.BrickColor = BrickColor.new("Really black")
+        head.Material = Enum.Material.Plastic
+
+        for _, accessory in pairs(char:GetChildren()) do
+            if accessory:IsA("Accessory") then
+                local handle = accessory:FindFirstChild("Handle")
+                if handle then
+                    local attachment = handle:FindFirstChildOfClass("Attachment")
+                    if attachment then
+                        local attachName = attachment.Name:lower()
+                        if attachName:find("hair") or attachName:find("hat") or attachName:find("face") then
+                            accessory:Destroy()
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    local function removeHeadless()
+        local char = player.Character
+        if not char then return end
+
+        local head = char:FindFirstChild("Head")
+        if head then
+            for _, child in pairs(head:GetChildren()) do
+                if child:IsA("SpecialMesh") then
+                    child:Destroy()
+                end
+            end
+
+            head.Transparency = 0
+            head.BrickColor = BrickColor.new("Light orange")
+            head.Material = Enum.Material.Plastic
+
+            local face = Instance.new("Decal")
+            face.Texture = "rbxasset://textures/face.png"
+            face.Face = Enum.NormalId.Front
+            face.Parent = head
+        end
+    end
+
+    local function applyKorbloxRightLeg()
+        local char = player.Character
+        if not char then return end
+
+        local rightLeg = char:FindFirstChild("Right Leg") or char:FindFirstChild("RightLowerLeg")
+        if not rightLeg then return end
+
+        local existingFake = char:FindFirstChild("FakeKorbloxLeg")
+        if existingFake then
+            existingFake:Destroy()
+        end
+
+        for _, child in pairs(rightLeg:GetChildren()) do
+            if child:IsA("SpecialMesh") then
+                child:Destroy()
+            end
+        end
+
+        local mesh = Instance.new("SpecialMesh")
+        mesh.MeshType = Enum.MeshType.FileMesh
+        mesh.MeshId = "rbxassetid://" .. korbloxMeshId
+        mesh.TextureId = "rbxassetid://" .. korbloxTextureId
+        mesh.Scale = Vector3.new(1, 1, 1)
+        mesh.Offset = Vector3.new(0, 0, 0)
+        mesh.Parent = rightLeg
+
+        rightLeg.Transparency = 0.1
+        rightLeg.BrickColor = BrickColor.new("Really black")
+        rightLeg.Material = Enum.Material.Plastic
+    end
+
+    local function removeKorbloxRightLeg()
+        local char = player.Character
+        if not char then return end
+
+        local rightLeg = char:FindFirstChild("Right Leg") or char:FindFirstChild("RightLowerLeg")
+        if rightLeg then
+            for _, child in pairs(rightLeg:GetChildren()) do
+                if child:IsA("SpecialMesh") then
+                    child:Destroy()
+                end
+            end
+
+            rightLeg.Transparency = 0
+            rightLeg.BrickColor = BrickColor.new("Light orange")
+            rightLeg.Material = Enum.Material.Plastic
+        end
+
+        local fakeLeg = char:FindFirstChild("FakeKorbloxLeg")
+        if fakeLeg then
+            fakeLeg:Destroy()
+        end
+    end
+
+    -- Public API
+    return {
+        SetFakeHeadless = function(enabled)
+            headlessEnabled = enabled
+            if enabled then
+                applyHeadless()
+                Success("Fake Headless", "Fake headless enabled!", 2)
+            else
+                removeHeadless()
+                Info("Fake Headless", "Fake headless disabled", 2)
+            end
+        end,
+
+        SetFakeKorblox = function(enabled)
+            korbloxEnabled = enabled
+            if enabled then
+                applyKorbloxRightLeg()
+                Success("Fake Korblox", "Fake Korblox enabled!", 2)
+            else
+                removeKorbloxRightLeg()
+                Info("Fake Korblox", "Fake Korblox disabled", 2)
+            end
+        end,
+
+        SetLoopEnabled = function(enabled, interval)
+            loopFakeBundleEnabled = enabled
+
+            if loopFakeBundleConnection then
+                loopFakeBundleConnection:Disconnect()
+                loopFakeBundleConnection = nil
+            end
+
+            if enabled then
+                local loopInterval = interval or 5
+                loopFakeBundleConnection = task.spawn(function()
+                    while loopFakeBundleEnabled do
+                        task.wait(loopInterval)
+                        if headlessEnabled then
+                            pcall(applyHeadless)
+                        end
+                        if korbloxEnabled then
+                            pcall(applyKorbloxRightLeg)
+                        end
+                    end
+                end)
+                Success("Loop Fake Bundle", "Loop started! Interval: " .. loopInterval .. "s", 2)
+            else
+                Info("Loop Fake Bundle", "Loop stopped", 2)
+            end
+        end,
+
+        GetLoopStatus = function()
+            return loopFakeBundleEnabled
+        end
+    }
+end)()
+
+-- ====================== EMOTE CHANGER (v5 - yo.lua method, EmoteClass wrapper) ====================== --
+-- Wrap EmoteClass.Activate → firesignal OnClientEvent with replacement ID
+-- NO metatable hooks → NO movement break → NO game corruption
+
+local currentEmotes = table.create(6, "")
+local selectEmotes = table.create(6, "")
+
+local emoteNameToId = {} -- "boldmarch" → 14
+local emoteIdToName = {} -- 14 → "BoldMarch"
+local cacheReady = false
+local recentlySwapped = false
+
+local function normalize(name)
+    return name:gsub("%s+", ""):lower()
+end
+
+local function getAllEmotes()
+    local itemsFolder = ReplicatedStorage:FindFirstChild("Items")
+    if not itemsFolder then return {} end
+
+    local allEmotes = {}
+    local function findEmotesFolders(parent)
+        for _, child in ipairs(parent:GetChildren()) do
+            if child:IsA("Folder") then
+                if child.Name == "Emotes" then
+                    for _, emote in ipairs(child:GetChildren()) do
+                        if emote:IsA("ModuleScript") and emote:GetAttribute("ID") then
+                            table.insert(allEmotes, {
+                                Name = emote.Name,
+                                ID = emote:GetAttribute("ID")
+                            })
+                        end
+                    end
+                else
+                    findEmotesFolders(child)
+                end
+            end
+        end
+    end
+    findEmotesFolders(itemsFolder)
+    return allEmotes
+end
+
+local function buildCache()
+    if cacheReady then return end
+    cacheReady = true
+
+    local allEmotes = getAllEmotes()
+    for _, e in ipairs(allEmotes) do
+        local norm = normalize(e.Name)
+        if not emoteNameToId[norm] then
+            emoteNameToId[norm] = e.ID
+            emoteIdToName[e.ID] = e.Name
+        end
+    end
+end
+
+local function findEmoteInfo(input)
+    buildCache()
+    if not input or input == "" then return nil end
+    local num = tonumber(input)
+    if num then
+        local name = emoteIdToName[num]
+        if name then return { Name = name, ID = num } end
+        return nil
+    end
+    local lower = input:lower()
+    for id, name in pairs(emoteIdToName) do
+        if name:lower() == lower then
+            return { Name = name, ID = id }
+        end
+    end
+    return nil
+end
+
+local function setEmote(emoteID)
+    if not emoteID then return end
+    local char = player.Character
+    if not char then return end
+    local tagValue = char:GetAttribute("Tag")
+    if not tagValue then return end
+    local tagBuf = buffer.create(2)
+    buffer.writeu16(tagBuf, 0, tagValue)
+
+    firesignal(ReplicatedStorage.Events.UpdateCharacterDataRegistry.OnClientEvent, {
+        buffer.fromstring("\24\1"),
+        emoteID,
+        tagBuf
+    })
+end
+
+local emoteReplacements = {} -- { currentName = replacementID }
+local hookInstalled = false
+local origActivate = nil
+local origDeactivate = nil
+local emoteWarmupUntil = 0 -- timestamp: jangan swap emote sampai waktu ini lewat
+
+local function startEmoteHook()
+    -- RESET state setiap kali masuk server baru (prevents stale refs)
+    if origActivate then
+        -- Restore original functions pada old EmoteClass sebelum reset
+        pcall(function()
+            local EmoteClass = require(ReplicatedStorage.Objects.Items.Emote)
+            EmoteClass.Activate = origActivate
+            EmoteClass.Deactivate = origDeactivate
+        end)
+    end
+    origActivate = nil
+    origDeactivate = nil
+    recentlySwapped = false
+    hookInstalled = false
+
+    buildCache()
+
+    -- Build replacement table
+    emoteReplacements = {}
+    for i = 1, 6 do
+        local curr = currentEmotes[i] or ""
+        local sel = selectEmotes[i] or ""
+        if curr ~= "" and sel ~= "" then
+            local cInfo = findEmoteInfo(curr)
+            local sInfo = findEmoteInfo(sel)
+            if cInfo and sInfo and cInfo.ID ~= sInfo.ID then
+                emoteReplacements[cInfo.Name] = sInfo.ID
+            end
+        end
+    end
+
+    if next(emoteReplacements) == nil then
+        hookInstalled = false
+        return
+    end
+
+    -- Wrap EmoteClass (fresh dari server baru)
+    local ok = pcall(function()
+        local EmoteClass = require(ReplicatedStorage.Objects.Items.Emote)
+
+        origActivate = EmoteClass.Activate
+        origDeactivate = EmoteClass.Deactivate
+
+        EmoteClass.Activate = function(self, p2, p3)
+            origActivate(self, p2, p3)
+
+            -- Skip swap selama warmup (game auto-idle pas round start)
+            if tick() < emoteWarmupUntil then return end
+
+            local module = self.EmoteModule
+            local currentName = module and module.Name
+
+            if currentName and not recentlySwapped then
+                local replacementId = emoteReplacements[currentName]
+                if replacementId then
+                    task.defer(function()
+                        if player.Character then
+                            recentlySwapped = true
+                            setEmote(replacementId)
+                        end
+                    end)
+                end
+            end
+        end
+
+        EmoteClass.Deactivate = function(self, ...)
+            origDeactivate(self, ...)
+            recentlySwapped = false
+        end
+
+        hookInstalled = true
+    end)
+end
+
+local function stopEmoteHook()
+    hookInstalled = false
+    recentlySwapped = false
+    emoteReplacements = {}
+
+    if origActivate and origDeactivate then
+        pcall(function()
+            local EmoteClass = require(ReplicatedStorage.Objects.Items.Emote)
+            EmoteClass.Activate = origActivate
+            EmoteClass.Deactivate = origDeactivate
+        end)
+    end
+end
+
+-- Auto-hook on respawn
+player.CharacterAdded:Connect(function()
+    -- Warmup 3 detik: biarin game settle, jangan swap emote auto-idle
+    emoteWarmupUntil = tick() + 3
+    stopEmoteHook()
+    task.wait(1)
+    startEmoteHook()
+end)
+
+local currentEmoteInputs = {}
+local selectEmoteInputs = {}
+
+-- Cosmetics variables
+local cosmetic1 = ""
+local cosmetic2 = ""
+local originalCosmetic1 = ""
+local originalCosmetic2 = ""
+local isSwappedCosmetic = false
+
+-- Helper: crawl semua folder "Cosmetics" di bawah Items (support struktur ItemPacks.Events.*.*.Cosmetics)
+local function getAllCosmeticsFolders()
+    local items = ReplicatedStorage:FindFirstChild("Items")
+    if not items then return {} end
+    local folders = {}
+    local function crawl(parent)
+        for _, child in ipairs(parent:GetChildren()) do
+            if child:IsA("Folder") and child.Name == "Cosmetics" then
+                table.insert(folders, child)
+            elseif child:IsA("Folder") or child:IsA("Model") then
+                crawl(child)
+            end
+        end
+    end
+    crawl(items)
+    return folders
+end
+
+-- Cari cosmetic folder by name: cek children langsung di Cosmetics, lalu children di Tier folder
+-- PENTING: cosmetic bisa Folder (berisi model + ModuleScript) atau ModuleScript (metadata doang)
+local function findCosmeticAnywhere(name)
+    local lower = name:lower():gsub("%s+", "")
+    for _, cosFolder in ipairs(getAllCosmeticsFolders()) do
+        for _, child in ipairs(cosFolder:GetChildren()) do
+            -- Case 1: cosmetic langsung di Cosmetics/ (e.g. Cosmetics/WebTraps)
+            if child.Name:lower():gsub("%s+", "") == lower then
+                -- Kalo ini Folder, return folder-nya (buat swap children model)
+                if child:IsA("Folder") then
+                    return child
+                end
+                -- Kalo ModuleScript tanpa folder, return parent Cosmetics
+                if child:IsA("ModuleScript") then
+                    return child
+                end
+            end
+            -- Case 2: Tier folder, cek children-nya
+            if child:IsA("Folder") then
+                for _, subChild in ipairs(child:GetChildren()) do
+                    if subChild.Name:lower():gsub("%s+", "") == lower then
+                        if subChild:IsA("Folder") then
+                            return subChild
+                        end
+                        if subChild:IsA("ModuleScript") then
+                            return subChild
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return nil
+end
+
+-- Fuzzy find cosmetic (cuma cek di Cosmetics/ dan Cosmetics/Tier/)
+local function findSimilarCosmetic(name)
+    local allCosFolders = getAllCosmeticsFolders()
+    if #allCosFolders == 0 then return nil end
+
+    local function levenshtein(s, t)
+        local m, n = #s, #t
+        if m == 0 then return n end
+        if n == 0 then return m end
+        local d = {}
+        for i = 0, m do d[i] = { [0] = i } end
+        for j = 0, n do d[0][j] = j end
+        for i = 1, m do
+            for j = 1, n do
+                local cost = s:sub(i, i) == t:sub(j, j) and 0 or 1
+                d[i][j] = math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + cost)
+            end
+        end
+        return d[m][n]
+    end
+
+    local nName = name:lower():gsub("%s+", "")
+    local bestMatch, bestScore = nil, 9999
+
+    local function checkItem(item)
+        if not item then return end
+        local itemNorm = item.Name:lower():gsub("%s+", "")
+        if itemNorm == nName then
+            bestMatch = item
+            bestScore = 0
+            return true
+        end
+        local dist = levenshtein(nName, itemNorm)
+        if dist < bestScore then
+            bestScore = dist
+            bestMatch = item
+        end
+    end
+
+    for _, cosFolder in ipairs(allCosFolders) do
+        for _, child in ipairs(cosFolder:GetChildren()) do
+            -- Priority: Folder dulu (buat swap model)
+            if child:IsA("Folder") then
+                if checkItem(child) and bestScore == 0 then return bestMatch end
+                for _, subChild in ipairs(child:GetChildren()) do
+                    if checkItem(subChild) and bestScore == 0 then return bestMatch end
+                end
+            else
+                if checkItem(child) and bestScore == 0 then return bestMatch end
+            end
+        end
+    end
+    if bestScore <= 3 and bestMatch then return bestMatch end
+    return nil
+end
+
+-- Swap model children (Character, CharacterClassic, dll) antara dua cosmetic
+-- item1 & item2 bisa ModuleScript atau Folder — model children ada DI DALAM item tersebut
+-- Contoh: ScarletSlash (ModuleScript) punya anak Character & CharacterClassic
+local function swapCosmeticModels(item1, item2)
+    -- Container = item itu sendiri (ModuleScript atau Folder) — bukan Parent-nya!
+    -- Karena Character & CharacterClassic ada sebagai anak langsung dari ModuleScript
+    local container1 = item1
+    local container2 = item2
+
+    -- Tukar semua children model (bukan script) antar container
+    local temp1 = Instance.new("Folder")
+    local temp2 = Instance.new("Folder")
+
+    for _, c in ipairs(container1:GetChildren()) do
+        if not c:IsA("ModuleScript") and not c:IsA("LocalScript") and not c:IsA("Script") then
+            c.Parent = temp1
+        end
+    end
+    for _, c in ipairs(container2:GetChildren()) do
+        if not c:IsA("ModuleScript") and not c:IsA("LocalScript") and not c:IsA("Script") then
+            c.Parent = temp2
+        end
+    end
+
+    for _, c in ipairs(temp1:GetChildren()) do
+        c.Parent = container2
+    end
+    for _, c in ipairs(temp2:GetChildren()) do
+        c.Parent = container1
+    end
+
+    temp1:Destroy()
+    temp2:Destroy()
+end
+
+-- ---------------------------- SHOW TIMER HELPER --------------------------- --
+
+local function setupGui()
+    local function CreateTimerGUI()
+        local MainInterface = Instance.new("ScreenGui")
+        local TimerContainer = Instance.new("Frame")
+        local AspectRatio = Instance.new("UIAspectRatioConstraint")
+        local SizeLimit = Instance.new("UISizeConstraint")
+        local TimerDisplay = Instance.new("Frame")
+        local RoundedCorners = Instance.new("UICorner")
+        local BorderOutline = Instance.new("UIStroke")
+        local PanelBackground = Instance.new("ImageLabel")
+        local BackgroundCorners = Instance.new("UICorner")
+        local OverlayImage = Instance.new("ImageLabel")
+        local StatusText = Instance.new("TextLabel")
+        local TextGradient = Instance.new("UIGradient")
+        local StatusBorder = Instance.new("UIStroke")
+        local CountdownText = Instance.new("TextLabel")
+        local TimerGradient = Instance.new("UIGradient")
+        local CountdownBorder = Instance.new("UIStroke")
+
+        MainInterface.Name = "BagahHubTimerGUI"
+        MainInterface.Parent = PlayerGui
+        MainInterface.ResetOnSpawn = false
+        MainInterface.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+        MainInterface.Enabled = true
+        MainInterface.DisplayOrder = 2
+        TimerContainer.Name = "TimerContainer"
+        TimerContainer.Parent = MainInterface
+        TimerContainer.AnchorPoint = Vector2.new(0.5, 0)
+        TimerContainer.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+        TimerContainer.BackgroundTransparency = 1.000
+        TimerContainer.BorderColor3 = Color3.fromRGB(27, 42, 53)
+        TimerContainer.Position = UDim2.new(0.5, 0, 0, 0)
+        TimerContainer.Size = UDim2.new(1, 0, 1, 0)
+        TimerContainer.Visible = false
+
+        AspectRatio.Parent = TimerContainer
+
+        SizeLimit.Parent = TimerContainer
+        SizeLimit.MaxSize = Vector2.new(900, 900)
+
+        TimerDisplay.Name = "TimerDisplay"
+        TimerDisplay.Parent = TimerContainer
+        TimerDisplay.AnchorPoint = Vector2.new(0.5, 0)
+        TimerDisplay.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+        TimerDisplay.BackgroundTransparency = 0.600
+        TimerDisplay.BorderColor3 = Color3.fromRGB(27, 42, 53)
+        TimerDisplay.BorderSizePixel = 0
+        TimerDisplay.Position = UDim2.new(0.5, 0, 0.0399999991, 0)
+        TimerDisplay.Size = UDim2.new(0.25, 0, 0.100000001, 0)
+        TimerDisplay.ZIndex = 10000
+
+        RoundedCorners.CornerRadius = UDim.new(0, 4)
+        RoundedCorners.Parent = TimerDisplay
+
+        BorderOutline.Parent = TimerDisplay
+        BorderOutline.Thickness = 1
+        BorderOutline.Color = Color3.fromRGB(0, 0, 0)
+        BorderOutline.Transparency = 0.8
+
+        PanelBackground.Name = "PanelBackground"
+        PanelBackground.Parent = TimerDisplay
+        PanelBackground.AnchorPoint = Vector2.new(0.5, 0.5)
+        PanelBackground.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+        PanelBackground.BackgroundTransparency = 1.000
+        PanelBackground.BorderColor3 = Color3.fromRGB(27, 42, 53)
+        PanelBackground.Position = UDim2.new(0.5, 0, 0.5, 0)
+        PanelBackground.Size = UDim2.new(1, 0, 1, 0)
+        PanelBackground.ZIndex = 9999
+        PanelBackground.Image = "rbxassetid://196969716"
+        PanelBackground.ImageColor3 = Color3.fromRGB(21, 21, 21)
+        PanelBackground.ImageTransparency = 0.700
+
+        BackgroundCorners.CornerRadius = UDim.new(0, 4)
+        BackgroundCorners.Parent = PanelBackground
+
+        OverlayImage.Parent = TimerDisplay
+        OverlayImage.AnchorPoint = Vector2.new(0.5, 0.5)
+        OverlayImage.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+        OverlayImage.BackgroundTransparency = 1.000
+        OverlayImage.BorderColor3 = Color3.fromRGB(27, 42, 53)
+        OverlayImage.Position = UDim2.new(0.5, 0, 0.5, 0)
+        OverlayImage.Size = UDim2.new(0.800000012, 0, 1, 0)
+        OverlayImage.ZIndex = 10001
+        OverlayImage.Image = "rbxassetid://6761866149"
+        OverlayImage.ImageColor3 = Color3.fromRGB(165, 194, 255)
+        OverlayImage.ImageTransparency = 0.900
+        OverlayImage.ScaleType = Enum.ScaleType.Crop
+
+        StatusText.Name = "StatusText"
+        StatusText.Parent = TimerDisplay
+        StatusText.AnchorPoint = Vector2.new(0.5, 0.5)
+        StatusText.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+        StatusText.BackgroundTransparency = 1.000
+        StatusText.BorderColor3 = Color3.fromRGB(27, 42, 53)
+        StatusText.Position = UDim2.new(0.5, 0, 0.25, 0)
+        StatusText.Size = UDim2.new(0.800000012, 0, 0.25, 0)
+        StatusText.ZIndex = 10002
+        StatusText.Font = Enum.Font.GothamBold
+        StatusText.Text = "ROUND ACTIVE"
+        StatusText.TextColor3 = Color3.fromRGB(165, 194, 255)
+        StatusText.TextScaled = true
+        StatusText.TextSize = 14.000
+        StatusText.TextStrokeTransparency = 0.950
+        StatusText.TextWrapped = true
+
+        TextGradient.Color = ColorSequence.new { ColorSequenceKeypoint.new(0.00, Color3.fromRGB(255, 255, 255)), ColorSequenceKeypoint.new(1.00, Color3.fromRGB(193, 193, 193)) }
+        TextGradient.Rotation = 90
+        TextGradient.Parent = StatusText
+
+        StatusBorder.Parent = StatusText
+        StatusBorder.Thickness = 2
+        StatusBorder.Color = Color3.fromRGB(0, 0, 0)
+        StatusBorder.Transparency = 0.5
+
+        CountdownText.Name = "CountdownText"
+        CountdownText.Parent = TimerDisplay
+        CountdownText.AnchorPoint = Vector2.new(0.5, 0.5)
+        CountdownText.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+        CountdownText.BackgroundTransparency = 1.000
+        CountdownText.BorderColor3 = Color3.fromRGB(27, 42, 53)
+        CountdownText.Position = UDim2.new(0.5, 0, 0.649999976, 0)
+        CountdownText.Size = UDim2.new(0.5, 0, 0.5, 0)
+        CountdownText.ZIndex = 10002
+        CountdownText.Font = Enum.Font.GothamBold
+        CountdownText.Text = "0:00"
+        CountdownText.TextColor3 = Color3.fromRGB(165, 194, 255)
+        CountdownText.TextScaled = true
+        CountdownText.TextSize = 14.000
+        CountdownText.TextStrokeTransparency = 0.950
+        CountdownText.TextWrapped = true
+
+        TimerGradient.Color = ColorSequence.new { ColorSequenceKeypoint.new(0.00, Color3.fromRGB(255, 255, 255)), ColorSequenceKeypoint.new(1.00, Color3.fromRGB(193, 193, 193)) }
+        TimerGradient.Rotation = 90
+        TimerGradient.Parent = CountdownText
+
+        CountdownBorder.Parent = CountdownText
+        CountdownBorder.Thickness = 2
+        CountdownBorder.Color = Color3.fromRGB(0, 0, 0)
+        CountdownBorder.Transparency = 0.5
+
+        return CountdownText, StatusText, MainInterface, TimerContainer
+    end
+
+    local TimerLabel, StatusLabel, MainInterface, TimerContainer = CreateTimerGUI()
+
+    local timerConnection
+
+    local function formatTime(seconds)
+        if not seconds then return "0:00" end
+
+        seconds = math.floor(tonumber(seconds) or 0)
+        local minutes = math.floor(seconds / 60)
+        local remainingSeconds = seconds % 60
+
+        return string.format("%d:%02d", minutes, remainingSeconds)
+    end
+
+    local function updateTimerDisplay()
+        local registry = ServerStateRegistryService and ServerStateRegistryService.Registry
+        local timerValue = registry and registry.Time or GameState.Get("Timer")
+        local roundStatus = registry and registry.RoundStatus
+        local roundStarted = roundStatus == 2 or GameState.Get("RoundStarted")
+
+        TimerLabel.Text = formatTime(timerValue)
+
+        TimerLabel.TextColor3 = timerValue and timerValue <= 5 and Color3.fromRGB(215, 100, 100) or
+            Color3.fromRGB(165, 194, 255)
+
+        StatusLabel.Text = roundStarted and "ROUND ACTIVE" or roundStatus == 1 and "INTERMISSION" or "WAITING"
+    end
+
+    local function setupTimerConnection()
+        -- Initial display
+        updateTimerDisplay()
+
+        local lastTimer, lastRoundStatus
+        timerConnection = RunService.Heartbeat:Connect(function()
+            local registry = ServerStateRegistryService and ServerStateRegistryService.Registry
+            local timerValue = registry and registry.Time or GameState.Get("Timer")
+            local roundStatus = registry and registry.RoundStatus or GameState.Get("RoundStarted")
+            if timerValue ~= lastTimer or roundStatus ~= lastRoundStatus then
+                lastTimer, lastRoundStatus = timerValue, roundStatus
+                updateTimerDisplay()
+            end
+        end)
+    end
+
+    setupTimerConnection()
+
+    local function cleanupTimer()
+        if timerConnection then
+            timerConnection:Disconnect()
+            timerConnection = nil
+        end
+    end
+end
+
+setupGui()
+-- ------------------------------ UI TAB VISUAL ----------------------------- --
+local VisualsTab = Window:Tab({
+    Icon = "palette",
+    Title = "Visual"
+})
+
+VisualsTab:Section({ Title = "Utilities", TextSize = 20 })
+VisualsTab:Divider()
+
+VisualsTab:Toggle({
+    Title = "Timer Display",
+    Flag = "TimerDisplayToggle",
+    Value = false,
+    Callback = function(state)
+        featureStates.TimerDisplay = state
+
+        local function getRoundTimer()
+            local pg = player.PlayerGui
+            local shared = pg:FindFirstChild("Shared")
+            local hud = shared and shared:FindFirstChild("HUD")
+            local overlay = hud and hud:FindFirstChild("Overlay")
+            local default = overlay and overlay:FindFirstChild("Default")
+            local ro = default and default:FindFirstChild("RoundOverlay")
+            local round = ro and ro:FindFirstChild("Round")
+            return round and round:FindFirstChild("RoundTimer")
+        end
+
+
+        local function setContainerVisible(visible)
+            local main = PlayerGui:FindFirstChild("BagahHubTimerGUI")
+            if main then
+                local container = main:FindFirstChild("TimerContainer")
+                if container then
+                    container.Visible = visible
+                end
+            end
+        end
+
+        if state then
+            task.spawn(function()
+                while featureStates.TimerDisplay do
+                    local timer = getRoundTimer()
+                    if timer then
+                        setContainerVisible(not timer.Visible)
+                    else
+                        setContainerVisible(true)
+                    end
+                    task.wait(0.1)
+                end
+                setContainerVisible(false)
+            end)
+        else
+            setContainerVisible(false)
+        end
+    end
+})
+
+
+VisualsTab:Section({ Title = "Emote Changer", TextSize = 20 })
+VisualsTab:Divider()
+
+
+-- Current Emote Inputs (1-6)
+for i = 1, 6 do
+    currentEmoteInputs[i] = VisualsTab:Input({
+        Title = "Current Emote " .. i,
+        Flag = "CurrentEmote" .. i,
+        Placeholder = "Enter current emote name",
+        Value = currentEmotes[i],
+        Callback = function(v)
+            currentEmotes[i] = v:gsub("%s+", "")
+        end
+    })
+end
+
+VisualsTab:Divider()
+
+-- Select Emote Inputs (1-6)
+for i = 1, 6 do
+    selectEmoteInputs[i] = VisualsTab:Input({
+        Title = "Select Emote " .. i,
+        Flag = "SelectEmote" .. i,
+        Placeholder = "Enter select emote name",
+        Value = selectEmotes[i],
+        Callback = function(v)
+            selectEmotes[i] = v:gsub("%s+", "")
+        end
+    })
+end
+
+-- Emote Option
+VisualsTab:Input({
+    Title = "Emote Possible option",
+    Flag = "EmoteOptionInput",
+    Desc = "Higher Value may break emote animation (recommended 1-3)",
+    Placeholder = "1",
+    Callback = function(v)
+        local num = tonumber(v) or 1
+
+        local function setupCharacter(character)
+            if character == player.Character then
+                character:SetAttribute("EmoteNum", num)
+            end
+        end
+
+        local function monitorCharacter()
+            while true do
+                wait(1)
+                local character = player.Character
+                if character and character:GetAttribute("EmoteNum") ~= num then
+                    character:SetAttribute("EmoteNum", num)
+                end
+            end
+        end
+
+        if player.Character then
+            setupCharacter(player.Character)
+        end
+
+        player.CharacterAdded:Connect(function(character)
+            wait(1)
+            setupCharacter(character)
+        end)
+
+        spawn(monitorCharacter)
+    end
+})
+
+-- Apply Button
+VisualsTab:Button({
+    Title = "Apply Emote Mappings",
+    Flag = "ApplyEmoteMappings",
+    Icon = "check",
+    Callback = function()
+        local hasAnyEmote = false
+
+        for i = 1, 6 do
+            if currentEmotes[i] ~= "" or selectEmotes[i] ~= "" then
+                hasAnyEmote = true
+                break
+            end
+        end
+
+        if not hasAnyEmote then
+            ObsidianUI:Notify({
+                Title = "Emote Changer",
+                Content = "Please enter your emote",
+                Duration = 3
+            })
+            return
+        end
+
+        local function isValidEmote(emoteName)
+            if emoteName == "" then return false, "" end
+
+            buildCache()
+            local info = findEmoteInfo(emoteName)
+            if info then
+                return true, info.Name
+            end
+            return false, ""
+        end
+
+        local sameEmoteSlots = {}
+        local missingEmoteSlots = {}
+        local invalidEmoteSlots = {}
+        local successfulSlots = {}
+
+        for i = 1, 6 do
+            if currentEmotes[i] ~= "" and selectEmotes[i] ~= "" then
+                local currentValid, currentActual = isValidEmote(currentEmotes[i])
+                local selectValid, selectActual = isValidEmote(selectEmotes[i])
+
+                if not currentValid and not selectValid then
+                    table.insert(invalidEmoteSlots,
+                        {
+                            slot = i,
+                            currentInvalid = true,
+                            currentName = currentEmotes[i],
+                            selectInvalid = true,
+                            selectName =
+                                selectEmotes[i]
+                        })
+                elseif not currentValid then
+                    table.insert(invalidEmoteSlots,
+                        {
+                            slot = i,
+                            currentInvalid = true,
+                            currentName = currentEmotes[i],
+                            selectInvalid = false,
+                            selectName =
+                                selectEmotes[i]
+                        })
+                elseif not selectValid then
+                    table.insert(invalidEmoteSlots,
+                        {
+                            slot = i,
+                            currentInvalid = false,
+                            currentName = currentEmotes[i],
+                            selectInvalid = true,
+                            selectName =
+                                selectEmotes[i]
+                        })
+                elseif currentActual:lower() == selectActual:lower() then
+                    table.insert(sameEmoteSlots, i)
+                else
+                    table.insert(successfulSlots, { slot = i, current = currentActual, select = selectActual })
+                end
+            elseif currentEmotes[i] ~= "" or selectEmotes[i] ~= "" then
+                table.insert(missingEmoteSlots, i)
+            end
+        end
+
+        local message = ""
+
+        if #successfulSlots > 0 then
+            message = message .. "✓ Successfully applied emote on:\n"
+            for _, data in ipairs(successfulSlots) do
+                message = message .. "Slot " .. data.slot .. " Emote: " .. data.current .. " → " .. data.select .. "\n"
+            end
+            message = message .. "\n"
+        end
+
+        if #sameEmoteSlots > 0 then
+            message = message .. "✗ Failed (same emote):\n"
+            for _, slot in ipairs(sameEmoteSlots) do
+                message = message .. "Slot " .. slot .. "\n"
+            end
+            message = message .. "\n"
+        end
+
+        if #invalidEmoteSlots > 0 then
+            message = message .. "✗ Failed (invalid emote):\n"
+            for _, data in ipairs(invalidEmoteSlots) do
+                message = message .. "Slot " .. data.slot
+                if data.currentInvalid and data.selectInvalid then
+                    message = message .. " - Both invalid\n"
+                elseif data.currentInvalid then
+                    message = message .. " - Current invalid\n"
+                else
+                    message = message .. " - Select invalid\n"
+                end
+            end
+            message = message .. "\n"
+        end
+
+        if #missingEmoteSlots > 0 then
+            message = message .. "✗ Failed (missing text):\n"
+            for _, slot in ipairs(missingEmoteSlots) do
+                message = message .. "Slot " .. slot .. "\n"
+            end
+        end
+
+        ObsidianUI:Notify({
+            Title = "Emote Changer",
+            Content = message,
+            Duration = 8
+        })
+
+        -- Restart hook dengan mapping baru
+        stopEmoteHook()
+        startEmoteHook()
+    end
+})
+
+-- Reset Button
+VisualsTab:Button({
+    Title = "Reset All Emotes",
+    Flag = "ResetAllEmotes",
+    Icon = "trash-2",
+    Callback = function()
+        stopEmoteHook()
+        for i = 1, 6 do
+            currentEmotes[i] = ""
+            selectEmotes[i] = ""
+
+            if currentEmoteInputs[i] and currentEmoteInputs[i].Set then
+                currentEmoteInputs[i]:Set("")
+            end
+            if selectEmoteInputs[i] and selectEmoteInputs[i].Set then
+                selectEmoteInputs[i]:Set("")
+            end
+        end
+
+        ObsidianUI:Notify({
+            Title = "Emote Changer",
+            Content = "All emotes have been reset!",
+            Duration = 3
+        })
+    end
+})
+
+VisualsTab:Divider()
+VisualsTab:Section({ Title = "Cosmetics Changer", TextSize = 20 })
+VisualsTab:Divider()
+
+VisualsTab:Input({
+    Title = "Cosmetic to Replace",
+    Flag = "CosmeticToReplace",
+    Desc = "Enter the cosmetic NAME you want to REPLACE (e.g., 'Jolly Crown')",
+    Value = "",
+    Placeholder = "Cosmetic that will be replaced",
+    Callback = function(Value)
+        cosmetic1 = Value
+        if not isSwappedCosmetic then
+            originalCosmetic1 = Value
+        end
+    end
+})
+
+VisualsTab:Input({
+    Title = "Replace With",
+    Flag = "ReplaceWith",
+    Desc = "Enter what cosmetic you want to USE instead (e.g., 'Toxic Inferno')",
+    Value = "",
+    Placeholder = "Cosmetic to use as replacement",
+    Callback = function(Value)
+        cosmetic2 = Value
+        if not isSwappedCosmetic then
+            originalCosmetic2 = Value
+        end
+    end
+})
+
+VisualsTab:Button({
+    Title = "Apply Cosmetics Swap",
+    Flag = "ApplyCosmeticsSwap",
+    Icon = "refresh-cw",
+    Callback = function()
+        pcall(function()
+            if cosmetic1 == "" or cosmetic2 == "" or cosmetic1 == cosmetic2 then
+                ObsidianUI:Notify({
+                    Title = "Cosmetics Changer",
+                    Content = "Please enter valid cosmetic names!",
+                    Duration = 3
+                })
+                return
+            end
+
+            -- Cari cosmetic (Folder atau ModuleScript) — swap model children-nya
+            local result1 = findSimilarCosmetic(cosmetic1)
+            local result2 = findSimilarCosmetic(cosmetic2)
+
+            if not result1 or not result2 then
+                ObsidianUI:Notify({
+                    Title = "Cosmetics Changer",
+                    Content = "Could not find: " .. cosmetic1 .. " or " .. cosmetic2,
+                    Duration = 3
+                })
+                return
+            end
+
+            cosmetic1 = result1.Name
+            cosmetic2 = result2.Name
+
+            if not isSwappedCosmetic then
+                originalCosmetic1 = cosmetic1
+                originalCosmetic2 = cosmetic2
+            end
+
+            swapCosmeticModels(result1, result2)
+            isSwappedCosmetic = true
+
+            ObsidianUI:Notify({
+                Title = "Cosmetics Changer",
+                Content = "Replaced: " .. cosmetic1 .. " → " .. cosmetic2 ..
+                    "\n(Equip '" .. cosmetic1 .. "' to see '" .. cosmetic2 .. "')",
+                Duration = 5
+            })
+        end)
+    end
+})
+
+VisualsTab:Button({
+    Title = "Reset Cosmetics",
+    Flag = "ResetCosmetics",
+    Desc = "Reset cosmetics to original state",
+    Icon = "rotate-ccw",
+    Callback = function()
+        pcall(function()
+            if not isSwappedCosmetic then
+                ObsidianUI:Notify({
+                    Title = "Cosmetics Changer",
+                    Content = "No cosmetics have been swapped yet!",
+                    Duration = 3
+                })
+                return
+            end
+
+            if originalCosmetic1 == "" or originalCosmetic2 == "" then
+                ObsidianUI:Notify({
+                    Title = "Cosmetics Changer",
+                    Content = "Original cosmetic names not found!",
+                    Duration = 3
+                })
+                return
+            end
+
+            local a = findCosmeticAnywhere(cosmetic1)
+            local b = findCosmeticAnywhere(cosmetic2)
+
+            if a and b then
+                swapCosmeticModels(a, b)
+                isSwappedCosmetic = false
+
+                ObsidianUI:Notify({
+                    Title = "Cosmetics Changer",
+                    Content = "Reset cosmetics to original state!",
+                    Duration = 3
+                })
+            else
+                ObsidianUI:Notify({
+                    Title = "Cosmetics Changer",
+                    Content = "Could not find swapped cosmetics!",
+                    Duration = 3
+                })
+            end
+        end)
+    end
+})
+
+
+VisualsTab:Divider()
+VisualsTab:Section({ Title = "Fake Cosmetics", TextSize = 20 })
+VisualsTab:Divider()
+
+VisualsTab:Toggle({
+    Title = "Fake Headless",
+    Flag = "FakeHeadlessToggle",
+    Desc = "Makes your head invisible",
+    Value = false,
+    Callback = function(state)
+        CosmeticModule.SetFakeHeadless(state)
+    end
+})
+
+VisualsTab:Toggle({
+    Title = "Fake Korblox",
+    Flag = "FakeKorbloxToggle",
+    Desc = "Fake Korblox deathwalker right leg",
+    Value = false,
+    Callback = function(state)
+        CosmeticModule.SetFakeKorblox(state)
+    end
+})
+
+local loopIntervalValue = 5
+
+VisualsTab:Input({
+    Title = "Loop Interval (seconds)",
+    Flag = "LoopIntervalInput",
+    Placeholder = "Default: 5",
+    Value = "5",
+    Callback = function(value)
+        local num = tonumber(value)
+        if num and num > 0 then
+            loopIntervalValue = num
+        end
+    end
+})
+
+VisualsTab:Toggle({
+    Title = "Loop Fake Cosmetics",
+    Flag = "LoopFakeCosmeticsToggle",
+    Desc = "Auto reapply fake cosmetics every interval",
+    Value = false,
+    Callback = function(state)
+        CosmeticModule.SetLoopEnabled(state, loopIntervalValue)
+    end
+})
+
+-- -------------------------------------------------------------------------- --
+--                                TELEPORT TAB                                --
+-- -------------------------------------------------------------------------- --
+-- ------------------------ TELEPORT FEATURES MODULE ----------------------- --
+
+local TeleportFeaturesModule = (function()
+    -- PRIVATE HELPERS
+    local function validateCharacter()
+        local char = player.Character
+        if not char then
+            Error("Teleport", "Character not found!", 2)
+            return nil, nil
+        end
+
+        local hrp = char:FindFirstChild("HumanoidRootPart")
+        if not hrp then
+            Error("Teleport", "HumanoidRootPart not found!", 2)
+            return nil, nil
+        end
+
+        return char, hrp
+    end
+
+    local function safeTeleport(hrp, targetPosition, filterInstances)
+        filterInstances = filterInstances or {}
+
+        -- Use raycast for safe positioning
+        local teleportPos = targetPosition + Vector3.new(0, 5, 0)
+
+        local raycastParams = RaycastParams.new()
+        raycastParams.FilterDescendantsInstances = filterInstances
+        raycastParams.FilterType = Enum.RaycastFilterType.Blacklist
+
+        local ray = workspace:Raycast(teleportPos, Vector3.new(0, -10, 0), raycastParams)
+        if ray then
+            teleportPos = ray.Position + Vector3.new(0, 3, 0)
+        end
+
+        hrp.CFrame = CFrame.new(teleportPos)
+        return true
+    end
+
+    local function findNearestTicketInternal()
+        local tickets = workspace.Effects and workspace.Effects:FindFirstChild("Tickets")
+        if not tickets then return nil end
+
+        local char = player.Character
+        if not char or not char:FindFirstChild("HumanoidRootPart") then return nil end
+
+        local hrp = char.HumanoidRootPart
+        local nearestTicket = nil
+        local nearestDistance = math.huge
+
+        for _, ticket in pairs(tickets:GetChildren()) do
+            if ticket:IsA("BasePart") or ticket:IsA("Model") then
+                local ticketPart = ticket:IsA("Model") and ticket:FindFirstChild("HumanoidRootPart") or ticket
+                if ticketPart and ticketPart:IsA("BasePart") then
+                    local dist = (hrp.Position - ticketPart.Position).Magnitude
+                    if dist < nearestDistance then
+                        nearestDistance = dist
+                        nearestTicket = ticketPart
+                    end
+                end
+            end
+        end
+
+        return nearestTicket
+    end
+
+    -- Helper for checking if player is downed
+    local function isPlayerDowned(pl)
+        if not pl or not pl.Character then return false end
+        local ok, cs = pcall(function() return require(ReplicatedStorage.Services.Asset.CharacterService) end)
+        if ok and cs then
+            local charData = cs:GetCharacterFromPlayer(pl)
+            if charData and charData.DataRegistry:Get("Downed") then
+                return true
+            end
+        end
+        local hum = pl.Character:FindFirstChild("Humanoid")
+        if hum and hum.Health <= 0 then return true end
+        return false
+    end
+
+    -- Helper for finding nearest downed player
+    local function findNearestDownedPlayer()
+        local char, hrp = validateCharacter()
+        if not char or not hrp then return nil end
+
+        local nearestPlayer = nil
+        local nearestDistance = math.huge
+
+        for _, pl in pairs(Players:GetPlayers()) do
+            if pl ~= player and pl.Character and pl.Character:FindFirstChild("HumanoidRootPart") then
+                if isPlayerDowned(pl) then
+                    local dist = (hrp.Position - pl.Character.HumanoidRootPart.Position).Magnitude
+                    if dist < nearestDistance then
+                        nearestDistance = dist
+                        nearestPlayer = pl
+                    end
+                end
+            end
+        end
+
+        return nearestPlayer, nearestDistance
+    end
+
+    -- PUBLIC API
+    return {
+        -- OBJECTIVE TELEPORT
+        TeleportToRandomObjective = function()
+            local char, hrp = validateCharacter()
+            if not char or not hrp then return false end
+
+            local objectives = {}
+            local mapFolder = workspace:FindFirstChild("Map")
+            if not mapFolder then
+                Error("Teleport", "Map folder not found!", 2)
+                return false
+            end
+
+            local partsFolder = mapFolder:FindFirstChild("Parts")
+            if not partsFolder then
+                Error("Teleport", "Parts folder not found!", 2)
+                return false
+            end
+
+            local objectivesFolder = partsFolder:FindFirstChild("Objectives")
+            if not objectivesFolder then
+                Error("Teleport", "Objectives folder not found!", 2)
+                return false
+            end
+
+            -- Collect all objectives
+            for _, obj in pairs(objectivesFolder:GetChildren()) do
+                if obj:IsA("Model") then
+                    local primaryPart = obj.PrimaryPart
+                    if not primaryPart then
+                        for _, part in pairs(obj:GetChildren()) do
+                            if part:IsA("BasePart") then
+                                primaryPart = part
+                                break
+                            end
+                        end
+                    end
+
+                    if primaryPart then
+                        table.insert(objectives, {
+                            Name = obj.Name,
+                            Part = primaryPart
+                        })
+                    end
+                end
+            end
+
+            if #objectives == 0 then
+                Error("Teleport", "No objectives found!", 2)
+                return false
+            end
+
+            local selectedObjective = objectives[math.random(1, #objectives)]
+            safeTeleport(hrp, selectedObjective.Part.Position, { char })
+            Success("Teleport", "Teleported to " .. selectedObjective.Name, 2)
+            return true
+        end,
+
+        -- TICKET TELEPORT
+        FindNearestTicket = findNearestTicketInternal,
+
+        TeleportToNearestTicket = function()
+            local char, hrp = validateCharacter()
+            if not char or not hrp then return false end
+
+            local ticket = findNearestTicketInternal()
+            if not ticket then
+                Error("Teleport", "No tickets found!", 2)
+                return false
+            end
+
+            safeTeleport(hrp, ticket.Position, { char })
+            Success("Teleport", "Teleported to nearest ticket!", 2)
+            return true
+        end,
+
+        -- PLAYER TELEPORTS
+        GetPlayerList = function()
+            local playerNames = {}
+            for _, pl in pairs(Players:GetPlayers()) do
+                if pl ~= player then
+                    table.insert(playerNames, pl.Name)
+                end
+            end
+            table.sort(playerNames)
+            return #playerNames > 0 and playerNames or { "No players available" }
+        end,
+
+        TeleportToPlayer = function(playerName)
+            if not playerName or playerName == "No players available" then
+                Error("Teleport", "No player selected!", 2)
+                return false
+            end
+
+            local char, hrp = validateCharacter()
+            if not char or not hrp then return false end
+
+            local targetPlayer = Players:FindFirstChild(playerName)
+            if not targetPlayer or not targetPlayer.Character or not targetPlayer.Character:FindFirstChild("HumanoidRootPart") then
+                Error("Teleport", playerName .. " not found or no character!", 2)
+                return false
+            end
+
+            local targetHRP = targetPlayer.Character.HumanoidRootPart
+            safeTeleport(hrp, targetHRP.Position, { char, targetPlayer.Character })
+            Success("Teleport", "Teleported to " .. playerName, 2)
+            return true
+        end,
+
+        TeleportToRandomPlayer = function()
+            local char, hrp = validateCharacter()
+            if not char or not hrp then return false end
+
+            local players = {}
+            for _, pl in pairs(Players:GetPlayers()) do
+                if pl ~= player and pl.Character and pl.Character:FindFirstChild("HumanoidRootPart") then
+                    table.insert(players, pl)
+                end
+            end
+
+            if #players == 0 then
+                Error("Teleport", "No other players found!", 2)
+                return false
+            end
+
+            local randomPlayer = players[math.random(1, #players)]
+            local targetHRP = randomPlayer.Character.HumanoidRootPart
+            safeTeleport(hrp, targetHRP.Position, { char, randomPlayer.Character })
+            Success("Teleport", "Teleported to " .. randomPlayer.Name, 2)
+            return true
+        end,
+
+
+        -- DOWNED PLAYER TELEPORTS (Public API)
+        IsPlayerDowned = isPlayerDowned,                   -- Expose local helper
+        FindNearestDownedPlayer = findNearestDownedPlayer, -- Expose local helper
+
+        TeleportToNearestDowned = function()
+            local char, hrp = validateCharacter()
+            if not char or not hrp then return false end
+
+            local nearestPlayer, distance = findNearestDownedPlayer() -- Use local helper
+            if not nearestPlayer then
+                Error("Teleport", "No downed players found!", 2)
+                return false
+            end
+
+            local targetHRP = nearestPlayer.Character.HumanoidRootPart
+            safeTeleport(hrp, targetHRP.Position, { char, nearestPlayer.Character })
+            Success("Teleport", "Teleported to " .. nearestPlayer.Name .. " (" .. math.floor(distance) .. " studs)", 2)
+            return true
+        end,
+    }
+end)()
+
+local TeleportTab = Window:Tab({
+    Icon = "navigation",
+    Title = "Teleport"
+})
+
+TeleportTab:Divider()
+TeleportTab:Section({ Title = "Objective Teleports", TextSize = 20 })
+TeleportTab:Divider()
+
+TeleportTab:Button({
+    Title = "Teleport to Objective",
+    Flag = "TeleportToObjectiveButton",
+    Icon = "map-pin",
+    Desc = "Teleport to a random objective",
+    Callback = function()
+        TeleportFeaturesModule.TeleportToRandomObjective()
+    end
+})
+
+TeleportTab:Button({
+    Title = "Teleport to Nearest Ticket",
+    Flag = "TeleportToNearestTicketButton",
+    Icon = "star",
+    Desc = "Teleport to the closest ticket",
+    Callback = function()
+        TeleportFeaturesModule.TeleportToNearestTicket()
+    end
+})
+
+
+TeleportTab:Divider()
+TeleportTab:Section({ Title = "Player Teleports", TextSize = 20 })
+TeleportTab:Divider()
+
+
+local selectedPlayerName = nil
+local PlayerListDropdown = nil
+
+local function getPlayerList()
+    return TeleportFeaturesModule.GetPlayerList()
 end
 
 local function refreshPlayerDropdown()
-    if TeleportUI.Dropdown then
-        local list = getPlayerList()
-        TeleportUI.Dropdown:Refresh(list)
-        if list[1] and list[1] ~= "No players" then
-            if not TeleportUI.PlayerName or not table.find(list, TeleportUI.PlayerName) then
-                TeleportUI.PlayerName = list[1]
-                TeleportUI.Dropdown:Select(TeleportUI.PlayerName)
+    if PlayerListDropdown then
+        local playerList = getPlayerList()
+        PlayerListDropdown:Refresh(playerList)
+        if playerList[1] and playerList[1] ~= "No players available" then
+            if not selectedPlayerName or not table.find(playerList, selectedPlayerName) then
+                selectedPlayerName = playerList[1]
+                PlayerListDropdown:Select(selectedPlayerName)
             end
         else
-            TeleportUI.PlayerName = nil
+            selectedPlayerName = nil
         end
     end
 end
 
-TeleportUI.Dropdown = PlayerTab:Dropdown({
+PlayerListDropdown = TeleportTab:Dropdown({
     Title = "Select Player",
-    Flag = "TeleportPlayerDropdown",
+    Flag = "PlayerListDropdown",
     Values = getPlayerList(),
-    Value = getPlayerList()[1] or "No players",
+    SearchBarEnabled = true,
+    Value = getPlayerList()[1] or "No players available",
     Callback = function(value)
-        if value ~= "No players" then
-            TeleportUI.PlayerName = value
+        if value ~= "No players available" then
+            selectedPlayerName = value
         end
     end
 })
 
-PlayerTab:Button({
-    Title = "Teleport to Player",
-    Description = "Teleport to the selected player",
-    Callback = function()
-        if not TeleportUI.PlayerName then
-            notify("Teleport", "No player selected", 2)
-            return
-        end
-        local char = LocalPlayer.Character
-        local hrp = char and char:FindFirstChild("HumanoidRootPart")
-        if not hrp then
-            notify("Teleport", "Character not found", 2)
-            return
-        end
-        local target = Players:FindFirstChild(TeleportUI.PlayerName)
-        if not target or not target.Character or not target.Character:FindFirstChild("HumanoidRootPart") then
-            notify("Teleport", TeleportUI.PlayerName .. " not found", 2)
-            refreshPlayerDropdown()
-            return
-        end
-        hrp.CFrame = target.Character.HumanoidRootPart.CFrame + Vector3.new(0, 3, 0)
-        notify("Teleport", "Teleported to " .. TeleportUI.PlayerName, 2)
-    end
-})
-
-PlayerTab:Button({
-    Title = "Refresh Player List",
-    Description = "Update the player list",
-    Callback = function()
-        refreshPlayerDropdown()
-        notify("Player List", "Refreshed", 2)
-    end
-})
 
 Players.PlayerAdded:Connect(function()
     task.wait(0.5)
@@ -3220,1214 +3761,150 @@ Players.PlayerRemoving:Connect(function()
     refreshPlayerDropdown()
 end)
 
--- ========================================================================= --
---                              AUTO PARRY TAB                               --
--- ========================================================================= --
-local AutoParryTab = Window:Tab({ Title = "Combat", Icon = "shield" })
-
--- ── Enable/Disable ────────────────────────────────────────────────────── --
-AutoParryTab:Section({ Title = "Auto Parry", TextSize = 20 })
-
-AutoParryTab:Toggle({
-    Title = "Perfect Auto Parry",
-    Description = "Ultra-fast automatic timing for regular and M2 parries; no setup required",
-    Default = true,
-    Callback = function(Value)
-        AutoParry.PerfectEnabled = Value
-        AutoParry.ParryToken += 1
-        AutoParry.PendingParry = {}
-        releaseBlock()
-        refreshAnimationWatchers()
-        if Value then
-            debugLog("[BagahHub STATE]", "Perfect Auto Parry enabled")
+TeleportTab:Button({
+    Title = "Teleport to Selected Player",
+    Flag = "TeleportToSelectedPlayerButton",
+    Icon = "user",
+    Desc = "Teleport to the player selected in dropdown",
+    Variant = "Primary",
+    Callback = function()
+        if TeleportFeaturesModule.TeleportToPlayer(selectedPlayerName) then
         else
-            debugLog("[BagahHub STATE]", "Perfect Auto Parry disabled")
+            refreshPlayerDropdown()
         end
     end
 })
 
-AutoParryTab:Toggle({
-    Title = "Animation Sync",
-    Description = "Optional high-precision timing from enemy animation progress; Perfect Auto Parry required",
-    Default = true,
-    Callback = function(Value)
-        AutoParry.AnimationSyncEnabled = Value
-        AutoParry.ParryToken += 1
-        AutoParry.PendingParry = {}
-        releaseBlock()
-        debugLog("[BagahHub STATE]", "Animation Sync", Value and "enabled" or "disabled")
+TeleportTab:Button({
+    Title = "Refresh Player List",
+    Flag = "RefreshPlayerListButton",
+    Icon = "refresh-cw",
+    Desc = "Update the player list manually",
+    Variant = "Secondary",
+    Callback = function()
+        refreshPlayerDropdown()
+        Info("Player List", "Player list refreshed!", 2)
     end
 })
 
-AutoParryTab:Toggle({
-    Title = "Parry Facing",
-    Description = "Automatically face the attacker when parrying attacks from any direction",
-    Default = true,
-    Callback = function(Value)
-        AutoParry.FacingEnabled = Value
-        if not Value then restoreParryFacing() end
-        debugLog("[BagahHub STATE]", "Parry Facing", Value and "enabled" or "disabled")
+TeleportTab:Divider()
+
+TeleportTab:Button({
+    Title = "Teleport to Random Player",
+    Flag = "TeleportToRandomPlayerButton",
+    Icon = "users",
+    Desc = "Teleport to a random player",
+    Callback = function()
+        TeleportFeaturesModule.TeleportToRandomPlayer()
     end
 })
 
-AutoParryTab:Toggle({
-    Title = "Grapple-Aware Combat",
-    Description = "Automatically backdash against grapple moves and all M2 attacks",
-    Default = false,
-    Callback = function(Value)
-        AutoParry.GrappleAwareEnabled = Value
-        AutoParry.LastGrappleDodge = 0
-        refreshAnimationWatchers()
-        debugLog("[BagahHub STATE]", "Grapple-Aware Combat",
-            Value and "enabled" or "disabled")
+TeleportTab:Divider()
+TeleportTab:Section({ Title = "Downed Player Teleports", TextSize = 20 })
+TeleportTab:Divider()
+
+
+
+TeleportTab:Button({
+    Title = "Teleport to Nearest Downed Player",
+    Flag = "TeleportToNearestDownedButton",
+    Icon = "navigation",
+    Desc = "Automatically teleport to the closest downed player",
+    Callback = function()
+        TeleportFeaturesModule.TeleportToNearestDowned()
     end
 })
-
-AutoParryTab:Toggle({
-    Title = "Auto Punish",
-    Description = "Instantly counter with one M1 after a confirmed perfect parry",
-    Default = false,
-    Callback = function(Value)
-        AutoParry.AutoPunishEnabled = Value
-        AutoParry.LastAutoPunish = 0
-        debugLog("[BagahHub STATE]", "Auto Punish", Value and "enabled" or "disabled")
-    end
-})
-
-AutoParryTab:Toggle({
-    Title = "Face Lock",
-    Description = "Continuously rotate toward the nearest enemy within range",
-    Default = false,
-    Callback = function(Value)
-        AutoParry.FaceLockEnabled = Value
-        if Value then
-            startFaceLock()
-        else
-            stopFaceLock()
-        end
-        debugLog("[BagahHub STATE]", "Face Lock", Value and "enabled" or "disabled")
-    end
-})
-
-AutoParryTab:Toggle({
-    Title = "Block M1 Until Parry",
-    Description = "Holds your M1 until the parry resolves, so it can't cancel the block",
-    Default = false,
-    Callback = function(Value)
-        AutoParry.BlockM1Enabled = Value
-        if Value then hookNamecall() end
-        debugLog("[BagahHub STATE]", "Block M1 Until Parry", Value and "enabled" or "disabled")
-    end
-})
-
-AutoParryTab:Toggle({
-    Title = "Hold Through Combo",
-    Description = "Holds block ~0.35s longer against fast M1 chains",
-    Default = false,
-    Callback = function(Value)
-        AutoParry.ComboHoldEnabled = Value
-        debugLog("[BagahHub STATE]", "Hold Through Combo", Value and "enabled" or "disabled")
-    end
-})
-
-AutoParryTab:Toggle({
-    Title = "Facing Check",
-    Description = "Only parry attackers that are actually facing you",
-    Default = false,
-    Callback = function(Value)
-        AutoParry.FacingCheckEnabled = Value
-        debugLog("[BagahHub STATE]", "Facing Check", Value and "enabled" or "disabled")
-    end
-})
-
-AutoParryTab:Section({ Title = "Parry Settings", TextSize = 20 })
-
--- ── Timing ────────────────────────────────────────────────────────────── --
-AutoParryTab:Slider({
-    Title = "Max Distance",
-    Description = "How far away a swing still gets picked up",
-    Flag = "EnemyDistanceSlider",
-    Value = { Min = 3, Max = 30, Default = 6 },
-    Step = 1,
-    Callback = function(Value)
-        AutoParry.MaxDistance = Value
-        PERFECT_PARRY_CONFIG.MaxDistance = Value + 12
-    end
-})
-
-AutoParryTab:Slider({
-    Title = "Face Target Range",
-    Description = "Max range Face Lock / Parry Facing will rotate you to square up",
-    Flag = "FaceTargetRangeSlider",
-    Value = { Min = 3, Max = 20, Default = 7 },
-    Step = 1,
-    Callback = function(Value)
-        AutoParry.FaceTargetRange = Value
-    end
-})
-
-AutoParryTab:Slider({
-    Title = "Parry Timing",
-    Description = "Seconds before impact the block is pressed",
-    Flag = "PerfectWindowLeadSlider",
-    Value = { Min = 0.01, Max = 0.35, Default = 0.06 },
-    Step = 0.005,
-    Callback = function(Value)
-        AutoParry.ImpactLead = Value
-    end
-})
-
-AutoParryTab:Slider({
-    Title = "Block Hold Time",
-    Description = "Seconds the block is held. Fine 0.01 steps for precise tuning",
-    Flag = "ParryHoldTimeSlider",
-    Value = { Min = 0.08, Max = 0.8, Default = 0.30 },
-    Step = 0.01,
-    Callback = function(Value)
-        AutoParry.ParryDuration = Value
-    end
-})
-
-AutoParryTab:Slider({
-    Title = "Ping Adjust %",
-    Description = "Scales ping compensation. 100% = default; raise if late, lower if early",
-    Flag = "PingAdjustSlider",
-    Value = { Min = 0, Max = 300, Default = 100 },
-    Step = 5,
-    Callback = function(Value)
-        AutoParry.PingAdjustPercent = Value
-    end
-})
-
-AutoParryTab:Section({ Title = "Fallback Safety Block", TextSize = 20 })
-
-AutoParryTab:Toggle({
-    Title = "Fallback Safety Block",
-    Description = "When parry can't trigger (too far), hold block briefly as a safety net",
-    Default = false,
-    Callback = function(Value)
-        AutoParry.FallbackBlockEnabled = Value
-        debugLog("[BagahHub STATE]", "Fallback Safety Block", Value and "enabled" or "disabled")
-    end
-})
-
-AutoParryTab:Slider({
-    Title = "Fallback Block Duration",
-    Description = "How long the safety block is held (seconds)",
-    Flag = "FallbackBlockDurationSlider",
-    Value = { Min = 0.1, Max = 1.5, Default = 0.45 },
-    Step = 0.05,
-    Callback = function(Value)
-        AutoParry.FallbackBlockDuration = Value
-    end
-})
-
-AutoParryTab:Slider({
-    Title = "Fallback Block Range",
-    Description = "Max distance to trigger safety block (studs)",
-    Flag = "FallbackBlockRangeSlider",
-    Value = { Min = 5, Max = 30, Default = 12 },
-    Step = 1,
-    Callback = function(Value)
-        AutoParry.FallbackBlockRange = Value
-    end
-})
-if DEBUG_TAB_ENABLED then
-    -- ========================================================================= --
-    --                                  DEBUG TAB                                 --
-    -- ========================================================================= --
-    local DebugTab = Window:Tab({ Title = "Debug", Icon = "bug" })
-
-    DebugTab:Toggle({
-        Title = "Auto Parry Debug Log",
-        Description = "Record Auto Parry events; press F8 to copy active debug logs",
-        Default = false,
-        Callback = function(value)
-            Dbg.Events = value
-            if value then
-                Dbg.StartedAt = os.clock()
-                table.clear(Dbg.Timeline)
-                debugLog("[BagahHub STATE]", "Auto Parry debug enabled")
-            end
-        end
-    })
-
-    DebugTab:Toggle({
-        Title = "Stun/Ragdoll Debug Log",
-        Description = "Record attributes, states, animations, properties, and outgoing remotes; press F8 to copy",
-        Default = false,
-        Callback = function(value)
-            Dbg.StunEvents = value
-            if value then
-                Dbg.StunStartedAt = os.clock()
-                table.clear(Dbg.StunTimeline)
-                hookNamecall()
-                attachStunDebug(LocalPlayer.Character)
-                stunDebugLog("STATE", "enabled", "AntiStun=", CS.AntiStun, "AntiRagdoll=", CS.AntiRagdoll)
-            else
-                disconnectStunDebugConnections()
-            end
-        end
-    })
-
-    DebugTab:Toggle({
-        Title = "Runtime Profiler",
-        Description =
-        "Capture simulation/render FPS, hitches, combat and animator callback counts every 2 seconds; use Copy Latest Runtime Profile to read it",
-        Default = false,
-        Callback = function(value)
-            if value then
-                startRuntimeProfiler()
-            else
-                stopRuntimeProfiler()
-            end
-        end
-    })
-
-    DebugTab:Toggle({
-        Title = "ESP Health Debug",
-        Description = "Log ESP Humanoid cache, death, respawn, and health changes to the console",
-        Default = false,
-        Callback = function(value)
-            EspHealthDebug.Enabled = value
-            table.clear(EspHealthDebug.LastState)
-            if value then
-                table.clear(EspHealthDebug.Timeline)
-                table.insert(EspHealthDebug.Timeline,
-                    string.format("+%.6f | ESP health debug enabled; enable an ESP visual to begin tracking", os.clock()))
-            end
-        end
-    })
-
-    DebugTab:Toggle({
-        Title = "Player HUD Health Debug",
-        Description = "Log local Humanoid health and Player HUD updates across respawns",
-        Default = false,
-        Callback = function(value)
-            HudHealthDebug.Enabled = value
-            HudHealthDebug.LastState = nil
-            if value then
-                table.clear(HudHealthDebug.Timeline)
-                table.insert(HudHealthDebug.Timeline,
-                    string.format("+%.6f | Player HUD health debug enabled", os.clock()))
-            end
-        end
-    })
-
-    DebugTab:Button({
-        Title = "Copy Latest Runtime Profile",
-        Description = "Copy the latest 2-second runtime profiler report",
-        Callback = function()
-            local success = pcall(function()
-                setclipboard(RuntimeProfiler.LastReport)
-            end)
-            if not success then
-                warn("[BagahHub PROFILE] Clipboard unavailable:", RuntimeProfiler.LastReport)
-            end
-        end
-    })
-
-    DebugTab:Button({
-        Title = "Copy Active Debug Logs",
-        Description = "Copy whichever debug logs are currently enabled (same as F8)",
-        Callback = copyActiveDebugLogs
-    })
-
-    DebugTab:Divider()
-
-    DebugTab:Toggle({
-        Title = "Rhythm Debug",
-        Description = "Logs note detection, timing, receptor coordinates, and input results",
-        Default = false,
-        Callback = function(value)
-            Rhythm.DebugEnabled = value
-            if value then
-                table.clear(Rhythm.DebugTimeline)
-                Rhythm.DebugStartedAt = os.clock()
-                rhythmDebug("DEBUG", "started")
-                rhythmScan()
-                rhythmDebugStructure()
-                rhythmDebugAndroidHierarchy()
-            end
-        end
-    })
-
-    DebugTab:Toggle({
-        Title = "Rhythm Rating Spy",
-        Description = "Detects Perfect/Good/Ok/Miss ratings from game UI and logs timing delta",
-        Default = false,
-        Callback = function(value)
-            Rhythm.RatingSpy = value
-            if value then
-                table.clear(Rhythm.RatingCounts)
-                Rhythm.RatingTotal = 0
-                table.clear(Rhythm.LastPressAt)
-                rhythmConnectRatingSpy(Rhythm.Root)
-                rhythmDebug("RATING SPY", "enabled", "root=", Rhythm.Root or "nil")
-            else
-                if Rhythm.RatingConn then
-                    Rhythm.RatingConn:Disconnect()
-                    Rhythm.RatingConn = nil
-                end
-                rhythmDebug("RATING SPY", "disabled", "total=", Rhythm.RatingTotal)
-            end
-        end
-    })
-
-    DebugTab:Toggle({
-        Title = "Rhythm GUI Inspector",
-        Description = "Watch RhythmServiceUI, RhythmRoot, Judgement, Note, and HitShard changes; press F8 to copy",
-        Default = false,
-        Callback = function(value)
-            Rhythm.GuiInspector = value
-            if value then
-                Rhythm.DebugEnabled = true
-                Rhythm.DebugStartedAt = os.clock()
-                table.clear(Rhythm.DebugTimeline)
-                rhythmScan()
-                rhythmConnectGuiInspector()
-            else
-                rhythmDebug("GUI INSPECT", "disabled")
-                rhythmDisconnectGuiInspector()
-            end
-        end
-    })
-
-    DebugTab:Divider()
-end
-
--- ========================================================================= --
---                                 ESP SUITE                                  --
--- ========================================================================= --
-local ESP = {
-    ShowBox          = false,
-    ShowHealth       = false,
-    ShowStamina      = false,
-    ShowTracer       = false,
-    ShowInfo         = false,
-    ShowHighlight    = false,
-    MaxDistance      = 200,
-    BoxColor         = Color3.fromRGB(255, 255, 255),
-    TracerColor      = Color3.fromRGB(255, 255, 255),
-    InfoColor        = Color3.fromRGB(255, 255, 255),
-    HighlightColor   = Color3.fromRGB(255, 60, 60),
-    Generation       = 0,
-    -- Internal state
-    Objects          = {},
-    Highlights       = {},
-    CharCache        = {},
-    FrameLocalRoot   = nil,
-    WorkspacePlayers = nil,
-    WorkspaceNpcs    = nil,
-}
-
-local function espHasEnabledFeature()
-    return ESP.ShowBox or ESP.ShowHealth or ESP.ShowStamina
-        or ESP.ShowTracer or ESP.ShowInfo or ESP.ShowHighlight
-end
-
-local function espRemoveDrawing(object)
-    if not object then return end
-    pcall(function() object.Visible = false end)
-    pcall(function() object:Remove() end)
-    pcall(function() object:Destroy() end)
-end
-
-local function espClearDrawingFields(fields)
-    for _, objects in pairs(ESP.Objects) do
-        for _, field in ipairs(fields) do
-            local object = objects[field]
-            if object then
-                espRemoveDrawing(object)
-                objects[field] = nil
-            end
-        end
-    end
-end
-
-local function espClearHighlights()
-    local models = {}
-    for model, _ in pairs(ESP.Highlights) do
-        table.insert(models, model)
-    end
-    for _, model in ipairs(models) do
-        local highlight = ESP.Highlights[model]
-        if highlight then
-            pcall(function()
-                highlight.Enabled = false
-                highlight:Destroy()
-            end)
-        end
-        ESP.Highlights[model] = nil
-    end
-end
-
-local function espHealthDebug(model, state, humanoid)
-    if not EspHealthDebug.Enabled then return end
-    local health = humanoid and humanoid.Health or -1
-    local maxHealth = humanoid and humanoid.MaxHealth or -1
-    local message = string.format("%s | health=%.1f/%.1f | humanoid=%s",
-        state, health, maxHealth, tostring(humanoid))
-    if EspHealthDebug.LastState[model] == message then return end
-    EspHealthDebug.LastState[model] = message
-    local line = string.format("+%.6f | %s | %s", os.clock(), model.Name, message)
-    table.insert(EspHealthDebug.Timeline, line)
-    if #EspHealthDebug.Timeline > 500 then table.remove(EspHealthDebug.Timeline, 1) end
-    print("[BagahHub ESP HEALTH]", line)
-end
-
-local function espGetCharacter(model)
-    if not model or not model:IsA("Model") then return nil end
-    if model == LocalPlayer.Character then return nil end
-
-    -- Return cached refs if still valid (avoids FindFirstChild per frame)
-    local cached = ESP.CharCache[model]
-    if cached and cached.HRP.Parent == model and cached.Humanoid.Parent == model then
-        if cached.Humanoid.Health > 0 then
-            espHealthDebug(model, "cached", cached.Humanoid)
-            return cached
-        end
-        espHealthDebug(model, "cached dead; clearing", cached.Humanoid)
-        ESP.CharCache[model] = nil
-    end
-
-    local hum = nil
-    for _, child in ipairs(model:GetChildren()) do
-        if child:IsA("Humanoid") and child.Health > 0 then
-            hum = child
-            break
-        end
-    end
-    local hrp = hum and hum.RootPart or model:FindFirstChild("HumanoidRootPart")
-    if not hrp or not hum then
-        espHealthDebug(model, "no live humanoid", hum)
-        ESP.CharCache[model] = nil
-        return nil
-    end
-
-    local data = { Model = model, HRP = hrp, Humanoid = hum, Head = model:FindFirstChild("Head"), Name = model.Name }
-    ESP.CharCache[model] = data
-    espHealthDebug(model, "resolved live humanoid", hum)
-    return data
-end
-
-local function espCreateDrawing(type)
-    local ok, result = pcall(function() return Drawing.new(type) end)
-    return ok and result or nil
-end
-
-local function espGetHealth(character)
-    local humanoid = character.Humanoid
-    local maxHealth = tonumber(humanoid.MaxHealth) or 100
-    local health = tonumber(humanoid.Health) or maxHealth
-
-    if maxHealth <= 0 then maxHealth = 100 end
-    return math.clamp(health / maxHealth, 0, 1), health, maxHealth
-end
-
-local function espClearModel(model)
-    local objs = ESP.Objects[model]
-    if objs then
-        for _, d in pairs(objs) do
-            espRemoveDrawing(d)
-        end
-        ESP.Objects[model] = nil
-    end
-    local hl = ESP.Highlights[model]
-    if hl then
-        pcall(function()
-            hl.Enabled = false
-            hl:Destroy()
-        end)
-        ESP.Highlights[model] = nil
-    end
-    EspHealthDebug.LastState[model] = nil
-end
-
-local function espHideModel(model)
-    local objs = ESP.Objects[model]
-    if objs then
-        for _, drawing in pairs(objs) do
-            drawing.Visible = false
-        end
-    end
-    local highlight = ESP.Highlights[model]
-    if highlight then highlight.Enabled = false end
-end
-
-local function espUpdateModel(model)
-    if not espHasEnabledFeature() then
-        espClearModel(model)
-        return
-    end
-
-    local char = espGetCharacter(model)
-    if not char then
-        espHideModel(model)
-        return
-    end
-
-    local cam = workspace.CurrentCamera
-    if not cam then return end
-
-    -- ── Distance check (uses cached localRoot from espRender) ─────── --
-    local dist = ESP.FrameLocalRoot and (ESP.FrameLocalRoot.Position - char.HRP.Position).Magnitude or math.huge
-    if dist > ESP.MaxDistance then
-        espHideModel(model)
-        return
-    end
-
-    -- ── Screen-space bounding box ────────────────────────────────── --
-    local head = char.Head
-    local headPos = head and head.Position or char.HRP.Position + Vector3.new(0, 2.5, 0)
-    local bottomPos = char.HRP.Position - Vector3.new(0, 1.2, 0)
-
-    local top, topVis = cam:WorldToViewportPoint(headPos + Vector3.new(0, 0.6, 0))
-    local bot, botVis = cam:WorldToViewportPoint(bottomPos)
-
-    if not (topVis or botVis) then
-        espHideModel(model)
-        return
-    end
-
-    local h = math.abs(top.Y - bot.Y)
-    local w = h * 0.55
-    local x = top.X - w / 2
-    local y = top.Y
-
-    local objs = ESP.Objects[model]
-    if not objs then
-        objs = {}
-        ESP.Objects[model] = objs
-    end
-
-    -- ── Box ──────────────────────────────────────────────────────── --
-    if ESP.ShowBox then
-        local box = objs.Box
-        if not box then
-            box = espCreateDrawing("Square"); objs.Box = box
-        end
-        if box then
-            box.Visible = true
-            box.Color = ESP.BoxColor
-            box.Filled = false
-            box.Thickness = 1.5
-            box.Position = Vector2.new(x, y)
-            box.Size = Vector2.new(w, h)
-        end
-    elseif objs.Box then
-        objs.Box.Visible = false
-    end
-
-    -- ── Health Bar ────────────────────────────────────────────────── --
-    local hp = espGetHealth(char)
-    if ESP.ShowHealth then
-        local barWidth = 5
-        local barX = x - barWidth - 4
-        local bar = objs.HealthBar
-        if not bar then
-            bar = espCreateDrawing("Square"); objs.HealthBar = bar
-        end
-        if bar then
-            bar.Visible = true
-            bar.Filled = true
-            bar.Color = Color3.fromRGB(0, 255, 80)
-            bar.ZIndex = 3
-            bar.Position = Vector2.new(barX, bot.Y - h * hp)
-            bar.Size = Vector2.new(barWidth, h * hp)
-        end
-        local bg = objs.HealthBg
-        if not bg then
-            bg = espCreateDrawing("Square"); objs.HealthBg = bg
-        end
-        if bg then
-            bg.Visible = true
-            bg.Filled = true
-            bg.Color = Color3.fromRGB(40, 40, 40)
-            bg.ZIndex = 2
-            bg.Position = Vector2.new(barX, y)
-            bg.Size = Vector2.new(barWidth, h)
-        end
-    else
-        if objs.HealthBar then objs.HealthBar.Visible = false end
-        if objs.HealthBg then objs.HealthBg.Visible = false end
-    end
-
-    -- ── Stamina Bar ────────────────────────────────────────────────── --
-    local stamAttr = model:GetAttribute("Stamina")
-    local stam = math.clamp(tonumber(stamAttr) or 0, 0, 100) / 100
-    if ESP.ShowStamina then
-        local barX = x - 10
-        local bar = objs.StaminaBar
-        if not bar then
-            bar = espCreateDrawing("Square"); objs.StaminaBar = bar
-        end
-        if bar then
-            bar.Visible = true
-            bar.Filled = true
-            bar.Color = Color3.fromRGB(100 + 155 * (1 - stam), 200 * stam, 255 * stam)
-            bar.ZIndex = 3
-            bar.Position = Vector2.new(barX, bot.Y - h * stam)
-            bar.Size = Vector2.new(3, h * stam)
-        end
-        local bg = objs.StaminaBg
-        if not bg then
-            bg = espCreateDrawing("Square"); objs.StaminaBg = bg
-        end
-        if bg then
-            bg.Visible = true
-            bg.Filled = true
-            bg.Color = Color3.fromRGB(40, 40, 40)
-            bg.ZIndex = 2
-            bg.Position = Vector2.new(barX, y)
-            bg.Size = Vector2.new(3, h)
-        end
-    else
-        if objs.StaminaBar then objs.StaminaBar.Visible = false end
-        if objs.StaminaBg then objs.StaminaBg.Visible = false end
-    end
-
-    -- ── Tracer ─────────────────────────────────────────────────────── --
-    if ESP.ShowTracer then
-        local tracer = objs.Tracer
-        if not tracer then
-            tracer = espCreateDrawing("Line"); objs.Tracer = tracer
-        end
-        if tracer then
-            tracer.Visible = true
-            tracer.Color = ESP.TracerColor
-            tracer.Thickness = 1.2
-            tracer.From = Vector2.new(cam.ViewportSize.X / 2, cam.ViewportSize.Y)
-            tracer.To = Vector2.new(top.X, bot.Y)
-        end
-    elseif objs.Tracer then
-        objs.Tracer.Visible = false
-    end
-
-    -- ── Name / Info ────────────────────────────────────────────────── --
-    if ESP.ShowInfo then
-        local tag = objs.NameTag
-        if not tag then
-            tag = espCreateDrawing("Text"); objs.NameTag = tag
-        end
-        if tag then
-            tag.Visible = true
-            tag.Color = ESP.InfoColor
-            tag.Size = 13
-            tag.Center = true
-            tag.Outline = true
-            tag.OutlineColor = Color3.new(0, 0, 0)
-            tag.Position = Vector2.new(top.X, top.Y - 5)
-
-            local text = char.Name
-            if hp < 1 then text = text .. string.format(" [%.0f%%]", hp * 100) end
-            if stam > 0 then text = text .. string.format(" · S:%.0f", stam * 100) end
-            if model:GetAttribute("Blocking") then text = text .. " | BLOCK" end
-            if model:GetAttribute("InCombat") then text = text .. " | FIGHT" end
-
-            tag.Text = text
-        end
-    elseif objs.NameTag then
-        objs.NameTag.Visible = false
-    end
-
-    -- ── Highlight (chams) ──────────────────────────────────────────── --
-    if ESP.ShowHighlight then
-        local hl = ESP.Highlights[model]
-        if not hl then
-            hl = Instance.new("Highlight")
-            hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-            hl.FillTransparency = 0.5
-            ESP.Highlights[model] = hl
-        end
-        hl.Parent = model
-        hl.FillColor = ESP.HighlightColor
-        hl.OutlineColor = ESP.HighlightColor
-        hl.Enabled = true
-    else
-        local hl = ESP.Highlights[model]
-        if hl then
-            hl.Enabled = false
-        end
-    end
-end
-
-local function espRender()
-    if not espHasEnabledFeature() then return end
-    local gen = ESP.Generation
-
-    -- Cache workspace containers (rarely change)
-    if not ESP.WorkspacePlayers or not ESP.WorkspacePlayers.Parent then
-        ESP.WorkspacePlayers = workspace:FindFirstChild("Players")
-    end
-
-    -- Cache local root once per frame (not per model)
-    local localChar = LocalPlayer.Character
-    ESP.FrameLocalRoot = localChar and localChar:FindFirstChild("HumanoidRootPart")
-
-    -- Single pass: update models + track active set
-    local active = {}
-
-    if ESP.WorkspacePlayers then
-        for _, model in ESP.WorkspacePlayers:GetChildren() do
-            if ESP.Generation ~= gen then return end
-            active[model] = true
-            espUpdateModel(model)
-        end
-    end
-
-    if ESP.Generation ~= gen then return end
-
-    -- Cleanup stale models (no second GetChildren needed)
-    local stale = {}
-    for model, _ in pairs(ESP.Objects) do
-        if not active[model] then table.insert(stale, model) end
-    end
-    for _, model in ipairs(stale) do
-        if ESP.Generation ~= gen then return end
-        espClearModel(model)
-        ESP.CharCache[model] = nil
-    end
-end
-
--- ========================================================================= --
---                                VISUAL TAB                                  --
--- ========================================================================= --
-local VisualTab = Window:Tab({ Title = "Visuals", Icon = "eye" })
-
-VisualTab:Section({ Title = "ESP", TextSize = 20 })
-
-VisualTab:Toggle({
-    Title = "Box",
-    Description = "2D rectangle around enemies",
-    Default = false,
-    Callback = function(value)
-        ESP.ShowBox = value
-        if not value then espClearDrawingFields({ "Box" }) end
-    end
-})
-
-VisualTab:Toggle({
-    Title = "Health Bar",
-    Description = "Health bar on the left side of the box",
-    Default = false,
-    Callback = function(value)
-        ESP.ShowHealth = value
-        if not value then espClearDrawingFields({ "HealthBar", "HealthBg" }) end
-    end
-})
-
-VisualTab:Toggle({
-    Title = "Stamina Bar",
-    Description = "Stamina bar on the left side of the box",
-    Default = false,
-    Callback = function(value)
-        ESP.ShowStamina = value
-        if not value then espClearDrawingFields({ "StaminaBar", "StaminaBg" }) end
-    end
-})
-
-VisualTab:Toggle({
-    Title = "Tracer",
-    Description = "Line from screen bottom to enemy",
-    Default = false,
-    Callback = function(value)
-        ESP.ShowTracer = value
-        if not value then espClearDrawingFields({ "Tracer" }) end
-    end
-})
-
-VisualTab:Toggle({
-    Title = "Name & Info",
-    Description = "Show player name, HP%, stamina, combat state",
-    Default = false,
-    Callback = function(value)
-        ESP.ShowInfo = value
-        if not value then espClearDrawingFields({ "NameTag" }) end
-    end
-})
-
-VisualTab:Toggle({
-    Title = "Highlight / Chams",
-    Description = "Outline + fill glow around enemies",
-    Default = false,
-    Callback = function(value)
-        ESP.ShowHighlight = value
-        if not value then espClearHighlights() end
-    end
-})
-
-VisualTab:Slider({
-    Title = "ESP Distance",
-    Description = "Max render distance for ESP",
-    Flag = "ESPDistanceSlider",
-    Value = { Min = 20, Max = 500, Default = 200 },
-    Step = 10,
-    Callback = function(value) ESP.MaxDistance = value end
-})
-
-VisualTab:Divider()
-
-VisualTab:Section({ Title = "Player HUD", TextSize = 20 })
-
-local HUD = { ShowHealth = false, ShowStamina = false, Objects = {}, Connections = {} }
-local AntiAfk = { Enabled = false, Conn = nil }
-
-local function hudCreateBar(yOffset)
-    local bar = {}
-    local ok1, bg = pcall(function() return Drawing.new("Square") end)
-    local ok2, fill = pcall(function() return Drawing.new("Square") end)
-    local ok3, txt = pcall(function() return Drawing.new("Text") end)
-    if not ok1 or not ok2 or not ok3 then return nil end
-    bg.Filled = true
-    bg.Color = Color3.fromRGB(20, 20, 20)
-    bg.Transparency = 0.4
-    bg.Thickness = 1
-    bg.Visible = false
-    fill.Filled = true
-    fill.Thickness = 1
-    fill.Visible = false
-    txt.Size = 13
-    txt.Center = true
-    txt.Outline = true
-    txt.OutlineColor = Color3.fromRGB(0, 0, 0)
-    txt.Color = Color3.fromRGB(255, 255, 255)
-    txt.Visible = false
-    bar.bg = bg
-    bar.fill = fill
-    bar.txt = txt
-    bar.yOffset = yOffset
-    return bar
-end
-
-local function hudUpdateBar(bar, percent, color, label)
-    if not bar then return end
-    local cam = workspace.CurrentCamera
-    if not cam then return end
-    local screenW = cam.ViewportSize.X
-    local screenH = cam.ViewportSize.Y
-    local barW = 220
-    local barH = 14
-    local x = (screenW - barW) / 2
-    local y = screenH - 60 + bar.yOffset
-    bar.bg.Size = Vector2.new(barW, barH)
-    bar.bg.Position = Vector2.new(x, y)
-    bar.bg.Visible = true
-    local fillW = math.floor(barW * (percent / 100))
-    bar.fill.Size = Vector2.new(fillW, barH)
-    bar.fill.Position = Vector2.new(x, y)
-    bar.fill.Color = color
-    bar.fill.Visible = true
-    bar.txt.Position = Vector2.new(screenW / 2, y - 1)
-    bar.txt.Text = label .. " " .. percent .. "%"
-    bar.txt.Visible = true
-end
-
-local function hudRemoveBar(bar)
-    if not bar then return end
-    pcall(function()
-        bar.bg.Visible = false; bar.bg:Remove()
-    end)
-    pcall(function()
-        bar.fill.Visible = false; bar.fill:Remove()
-    end)
-    pcall(function()
-        bar.txt.Visible = false; bar.txt:Remove()
-    end)
-end
-
-local function hudHealthDebug(state, humanoid)
-    if not HudHealthDebug.Enabled then return end
-    local message = string.format("%s | health=%.1f/%.1f | humanoid=%s",
-        state, humanoid and humanoid.Health or -1, humanoid and humanoid.MaxHealth or -1,
-        tostring(humanoid))
-    if HudHealthDebug.LastState == message then return end
-    HudHealthDebug.LastState = message
-    local line = string.format("+%.6f | %s", os.clock(), message)
-    table.insert(HudHealthDebug.Timeline, line)
-    if #HudHealthDebug.Timeline > 300 then table.remove(HudHealthDebug.Timeline, 1) end
-    print("[BagahHub HUD HEALTH]", line)
-end
-
-local function hudUpdateHealth()
-    if not (HUD.ShowHealth and HUD.Objects.health) then return end
-    local char = LocalPlayer.Character
-    if not char then return end
-    local hum = char:FindFirstChildOfClass("Humanoid")
-    if not hum then return end
-    hudHealthDebug("render", hum)
-    local hpPercent = math.floor((hum.Health / hum.MaxHealth) * 100)
-    local color = hpPercent > 50 and Color3.fromRGB(80, 255, 80)
-        or hpPercent > 25 and Color3.fromRGB(255, 200, 0)
-        or Color3.fromRGB(255, 60, 60)
-    hudUpdateBar(HUD.Objects.health, hpPercent, color, "HP")
-end
-
-local function hudUpdateStamina()
-    if not (HUD.ShowStamina and HUD.Objects.stamina) then return end
-    local char = LocalPlayer.Character
-    if not char then return end
-    local stamina = math.floor(char:GetAttribute("Stamina") or 100)
-    local color = stamina > 50 and Color3.fromRGB(80, 180, 255)
-        or stamina > 25 and Color3.fromRGB(255, 200, 0)
-        or Color3.fromRGB(255, 60, 60)
-    hudUpdateBar(HUD.Objects.stamina, stamina, color, "STA")
-end
-
-local function startHud()
-    -- Disconnect old connections
-    for _, conn in ipairs(HUD.Connections) do conn:Disconnect() end
-    table.clear(HUD.Connections)
-
-    if HUD.ShowHealth then
-        if not HUD.Objects.health then HUD.Objects.health = hudCreateBar(-20) end
-        local char = LocalPlayer.Character
-        if char then
-            local hum = char:FindFirstChildOfClass("Humanoid")
-            if hum then
-                hudHealthDebug("connected", hum)
-                hudUpdateHealth()
-                table.insert(HUD.Connections, hum:GetPropertyChangedSignal("Health"):Connect(hudUpdateHealth))
-                table.insert(HUD.Connections, hum:GetPropertyChangedSignal("MaxHealth"):Connect(hudUpdateHealth))
-            end
-        end
-    end
-    if HUD.ShowStamina then
-        if not HUD.Objects.stamina then HUD.Objects.stamina = hudCreateBar(0) end
-        local char = LocalPlayer.Character
-        if char then
-            hudUpdateStamina()
-            table.insert(HUD.Connections, char:GetAttributeChangedSignal("Stamina"):Connect(hudUpdateStamina))
-        end
-    end
-end
-
-local function stopHud()
-    if not HUD.ShowHealth and not HUD.ShowStamina then
-        for _, conn in ipairs(HUD.Connections) do conn:Disconnect() end
-        table.clear(HUD.Connections)
-        for _, bar in pairs(HUD.Objects) do hudRemoveBar(bar) end
-        HUD.Objects = {}
-    end
-end
-
-LocalPlayer.CharacterAdded:Connect(function(character)
-    if not HUD.ShowHealth and not HUD.ShowStamina then return end
-    task.spawn(function()
-        local humanoid = character:WaitForChild("Humanoid", 5)
-        if humanoid and character == LocalPlayer.Character then
-            startHud()
-        end
-    end)
-end)
-
-VisualTab:Toggle({
-    Title = "Show Health",
-    Description = "Health bar at bottom-center of screen",
-    Default = false,
-    Callback = function(value)
-        HUD.ShowHealth = value
-        if value then
-            if not HUD.Objects.health then HUD.Objects.health = hudCreateBar(-20) end
-            startHud()
-        else
-            hudRemoveBar(HUD.Objects.health)
-            HUD.Objects.health = nil
-            stopHud()
-        end
-    end
-})
-
-VisualTab:Toggle({
-    Title = "Show Stamina",
-    Description = "Stamina bar at bottom-center of screen",
-    Default = false,
-    Callback = function(value)
-        HUD.ShowStamina = value
-        if value then
-            if not HUD.Objects.stamina then HUD.Objects.stamina = hudCreateBar(0) end
-            startHud()
-        else
-            hudRemoveBar(HUD.Objects.stamina)
-            HUD.Objects.stamina = nil
-            stopHud()
-        end
-    end
-})
-
-
-local function startAntiAfk()
-    if AntiAfk.Conn then return end
-    AntiAfk.Conn = LocalPlayer.Idled:Connect(function()
-        VirtualUser:Button2Down(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
-        task.wait(1)
-        VirtualUser:Button2Up(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
-    end)
-end
-
-local function stopAntiAfk()
-    if AntiAfk.Conn then
-        AntiAfk.Conn:Disconnect()
-        AntiAfk.Conn = nil
-    end
-end
-
-local MiscTab = Window:Tab({ Title = "Misc", Icon = "music" })
-
-MiscTab:Section({ Title = "Music Game Rhythm", TextSize = 20 })
-
-MiscTab:Toggle({
-    Title = "Rhythm Auto",
-    Description = "Automatically plays Gakuran rhythm notes (F6 is also supported)",
-    Default = false,
-    Callback = function(value)
-        setRhythmEnabled(value)
-    end
-})
-
-MiscTab:Dropdown({
-    Title = "Timing Mode",
-    Description = "Always Perfect = hit every note perfectly | Custom Mix = random PERFECT/GOOD/OK/BAD",
-    Flag = "RhythmTimingMode",
-    Values = { "Always Perfect", "Custom Mix" },
-    Value = "Always Perfect",
-    Callback = function(value)
-        Rhythm.Mode = value == "Custom Mix" and "custom" or "perfect"
-    end
-})
-
-MiscTab:Slider({
-    Title = "Press Lead (ms)",
-    Description = "Extra early input; 2-note mode automatically adds 12ms",
-    Flag = "RhythmPressLead",
-    Value = { Min = 0, Max = 100, Default = 0 },
-    Step = 5,
-    Callback = function(value)
-        Rhythm.PressLeadMs = value
-    end
-})
-
-MiscTab:Slider({
-    Title = "Hold Extend (ms)",
-    Description = "Extra milliseconds to hold long notes (default 80)",
-    Flag = "RhythmHoldExtend",
-    Value = { Min = 0, Max = 300, Default = 80 },
-    Step = 10,
-    Callback = function(value)
-        Rhythm.HoldExtendMs = value
-    end
-})
-
-MiscTab:Slider({
-    Title = "PERFECT %",
-    Description = "Custom Mix: chance of PERFECT hit per note",
-    Flag = "RhythmPerfectChance",
-    Value = { Min = 0, Max = 100, Default = 70 },
-    Step = 5,
-    Callback = function(value)
-        Rhythm.PerfectChance = value
-    end
-})
-
-MiscTab:Slider({
-    Title = "GOOD %",
-    Description = "Custom Mix: chance of GOOD hit per note",
-    Flag = "RhythmGoodChance",
-    Value = { Min = 0, Max = 100, Default = 25 },
-    Step = 5,
-    Callback = function(value)
-        Rhythm.GoodChance = value
-    end
-})
-
-MiscTab:Slider({
-    Title = "OK %",
-    Description = "Custom Mix: chance of OK hit per note (rest = BAD)",
-    Flag = "RhythmOkChance",
-    Value = { Min = 0, Max = 100, Default = 5 },
-    Step = 5,
-    Callback = function(value)
-        Rhythm.OkChance = value
-    end
-})
-
-MiscTab:Toggle({
-    Title = "Anti AFK",
-    Description = "Prevent auto-kick by simulating input when idle",
-    Default = true,
-    Callback = function(value)
-        AntiAfk.Enabled = value
-        if value then
-            startAntiAfk()
-        else
-            stopAntiAfk()
-        end
-    end
-})
-
 
 -- -------------------------------------------------------------------------- --
---                             SERVER INFORMATION                             --
+--                              SERVER UTILITIES                              --
 -- -------------------------------------------------------------------------- --
+
+-- ------------------------- Helper Function Server ------------------------- --
 
 local function getServerLink()
-    return string.format("https://www.roblox.com/games/start?placeId=%d&jobId=%s", game.PlaceId, game.JobId)
+    return string.format("https://www.roblox.com/games/start?placeId=%d&jobId=%s", placeId, jobId)
 end
 
-local GAKURAN_LOADER_URL = "https://api.jnkie.com/api/v1/luascripts/public/6822e52f14d974d7ab5e785174576c7ebc8dff5ed50af79df6fbda0bd4c53f49/download"
-local AutoExecuteOnTeleport = true
-local teleportQueueAttempted = false
-local teleportQueueSucceeded = false
+local function joinServerByPlaceId(targetPlaceId, modeName)
+    local success, servers = pcall(function()
+        return HttpService:JSONDecode(game:HttpGet("https://games.roblox.com/v1/games/" ..
+            targetPlaceId .. "/servers/Public?sortOrder=Asc&limit=100"))
+    end)
 
-local function queueGakuranReload()
-    if teleportQueueAttempted then return teleportQueueSucceeded end
-    teleportQueueAttempted = true
+    if success and servers and servers.data and #servers.data > 0 then
+        local availableServers = {}
+        for _, server in ipairs(servers.data) do
+            if server.playing < server.maxPlayers then
+                table.insert(availableServers, server)
+            end
+        end
 
-    local env = getfenv and getfenv() or _G
-    local synApi = rawget(env, "syn")
-    local fluxusApi = rawget(env, "fluxus")
-    local queue = rawget(env, "queue_on_teleport")
-        or (typeof(synApi) == "table" and synApi.queue_on_teleport)
-        or (typeof(fluxusApi) == "table" and fluxusApi.queue_on_teleport)
-    if typeof(queue) ~= "function" then
-        Warning("Auto Execute Unavailable", "Your executor does not support queue_on_teleport", 3)
-        return false
+        if #availableServers > 0 then
+            table.sort(availableServers, function(a, b) return a.playing > b.playing end)
+            local targetServer = availableServers[1]
+
+            ObsidianUI:Notify({
+                Title = "Joining " .. modeName,
+                Content = "Teleporting to server with " ..
+                    targetServer.playing .. "/" .. targetServer.maxPlayers .. " players",
+                Duration = 3
+            })
+
+            TeleportService:TeleportToPlaceInstance(targetPlaceId, targetServer.id, player)
+        else
+            ObsidianUI:Notify({
+                Title = "Join Failed",
+                Content = "No available " .. modeName .. " servers found!",
+                Duration = 3
+            })
+        end
+    else
+        ObsidianUI:Notify({
+            Title = "Join Failed",
+            Content = "Could not fetch " .. modeName .. " servers!",
+            Duration = 3
+        })
     end
-
-    local loader = string.format("loadstring(game:HttpGet(%q))()", GAKURAN_LOADER_URL)
-    local success, err = pcall(queue, loader)
-    if not success then
-        Warning("Auto Execute Failed", tostring(err), 3)
-        return false
-    end
-    teleportQueueSucceeded = true
-    return true
 end
 
-LocalPlayer.OnTeleport:Connect(function(state)
-    if AutoExecuteOnTeleport and state == Enum.TeleportState.Started then
-        queueGakuranReload()
-    end
-end)
 
-local ServerTab = Window:Tab({ Icon = "server", Title = "Server" })
+-- ------------------------------ TAB UI SERVER ----------------------------- --
+
+local ServerTab = Window:Tab({
+    Icon = "server",
+    Title = "Server Utilities"
+})
 
 ServerTab:Section({ Title = "Server Info", TextSize = 20 })
 ServerTab:Divider()
 
-ServerTab:Paragraph({
-    Title = "Server ID",
-    Desc = game.JobId
+local gameModeName = "Loading..."
+local GameModeParagraph = ServerTab:Paragraph({
+    Title = "Game Mode",
+    Desc = gameModeName
 })
 
-ServerTab:Paragraph({
-    Title = "Place ID",
-    Desc = tostring(game.PlaceId)
-})
-
-ServerTab:Divider()
-ServerTab:Section({ Title = "Quick Actions", TextSize = 20 })
-ServerTab:Divider()
+task.spawn(function()
+    local success, productInfo = pcall(function()
+        return MarketplaceService:GetProductInfo(placeId)
+    end)
+    if success and productInfo then
+        local fullName = productInfo.Name
+        if fullName:find("Evade %- ") then
+            gameModeName = fullName:match("Evade %- (.+)") or fullName
+        else
+            gameModeName = fullName
+        end
+        if GameModeParagraph and GameModeParagraph.SetDesc then
+            GameModeParagraph:SetDesc(gameModeName)
+        end
+    else
+        gameModeName = "Unknown"
+        if GameModeParagraph and GameModeParagraph.SetDesc then
+            GameModeParagraph:SetDesc(gameModeName)
+        end
+    end
+end)
 
 ServerTab:Button({
     Title = "Copy Server Link",
@@ -4449,16 +3926,37 @@ ServerTab:Button({
     end
 })
 
+local numPlayers = #Players:GetPlayers()
+local maxPlayers = Players.MaxPlayers
+
+ServerTab:Paragraph({
+    Title = "Current Players",
+    Desc = numPlayers .. " / " .. maxPlayers
+})
+
+ServerTab:Paragraph({
+    Title = "Server ID",
+    Desc = jobId
+})
+
+ServerTab:Paragraph({
+    Title = "Place ID",
+    Desc = tostring(placeId)
+})
+
+
+ServerTab:Divider()
+ServerTab:Section({ Title = "Quick Actions", TextSize = 20 })
+ServerTab:Divider()
+
 ServerTab:Button({
     Title = "Rejoin Server",
     Desc = "Rejoin the current server",
     Icon = "refresh-cw",
     Callback = function()
-        queueGakuranReload()
-        game:GetService("TeleportService"):Teleport(game.PlaceId, LocalPlayer)
+        TeleportService:Teleport(game.PlaceId, player)
     end
 })
-
 
 ServerTab:Button({
     Title = "Server Hop",
@@ -4466,22 +3964,35 @@ ServerTab:Button({
     Icon = "shuffle",
     Callback = function()
         local success, servers = pcall(function()
-            return game:GetService("HttpService"):JSONDecode(game:HttpGet("https://games.roblox.com/v1/games/" ..
-                game.PlaceId .. "/servers/Public?sortOrder=Asc&limit=100"))
+            return HttpService:JSONDecode(game:HttpGet("https://games.roblox.com/v1/games/" ..
+                placeId .. "/servers/Public?sortOrder=Asc&limit=100"))
         end)
+
         if success and servers and servers.data and #servers.data > 0 then
+            -- Filter servers with at least 5 players
             local filteredServers = {}
             for _, server in ipairs(servers.data) do
-                if server.playing >= 5 then table.insert(filteredServers, server) end
+                if server.playing >= 5 then
+                    table.insert(filteredServers, server)
+                end
             end
+
             if #filteredServers > 0 then
                 local randomServer = filteredServers[math.random(1, #filteredServers)]
-                game:GetService("TeleportService"):TeleportToPlaceInstance(game.PlaceId, randomServer.id, LocalPlayer)
+                TeleportService:TeleportToPlaceInstance(placeId, randomServer.id, player)
             else
-                ObsidianUI:Notify({ Title = "Server Hop Failed", Content = "No servers with 5+ players found!", Duration = 3 })
+                ObsidianUI:Notify({
+                    Title = "Server Hop Failed",
+                    Content = "No servers with 5+ players found!",
+                    Duration = 3
+                })
             end
         else
-            ObsidianUI:Notify({ Title = "Server Hop Failed", Content = "Could not fetch servers!", Duration = 3 })
+            ObsidianUI:Notify({
+                Title = "Server Hop Failed",
+                Content = "Could not fetch servers!",
+                Duration = 3
+            })
         end
     end
 })
@@ -4492,145 +4003,773 @@ ServerTab:Button({
     Icon = "minimize",
     Callback = function()
         local success, servers = pcall(function()
-            return game:GetService("HttpService"):JSONDecode(game:HttpGet("https://games.roblox.com/v1/games/" ..
-                game.PlaceId .. "/servers/Public?sortOrder=Asc&limit=100"))
+            return HttpService:JSONDecode(game:HttpGet("https://games.roblox.com/v1/games/" ..
+                placeId .. "/servers/Public?sortOrder=Asc&limit=100"))
         end)
+
         if success and servers and servers.data and #servers.data > 0 then
             table.sort(servers.data, function(a, b) return a.playing < b.playing end)
             if servers.data[1] then
-                game:GetService("TeleportService"):TeleportToPlaceInstance(game.PlaceId, servers.data[1].id, LocalPlayer)
+                TeleportService:TeleportToPlaceInstance(placeId, servers.data[1].id, player)
             end
         else
-            ObsidianUI:Notify({ Title = "Server Hop Failed", Content = "Could not fetch servers!", Duration = 3 })
+            ObsidianUI:Notify({
+                Title = "Server Hop Failed",
+                Content = "Could not fetch servers!",
+                Duration = 3
+            })
+        end
+    end
+})
+
+ServerTab:Divider()
+ServerTab:Section({ Title = "Join Server", TextSize = 20 })
+ServerTab:Divider()
+
+ServerTab:Button({
+    Title = "Join Big Team",
+    Desc = "Join the most populated Big Team server",
+    Icon = "users",
+    Callback = function()
+        joinServerByPlaceId(10324346056, "Big Team")
+    end
+})
+
+ServerTab:Button({
+    Title = "Join Casual",
+    Desc = "Join the most populated Casual server",
+    Icon = "coffee",
+    Callback = function()
+        joinServerByPlaceId(10662542523, "Casual")
+    end
+})
+
+ServerTab:Button({
+    Title = "Join Social Space",
+    Desc = "Join the most populated Social Space server",
+    Icon = "message-square",
+    Callback = function()
+        joinServerByPlaceId(10324347967, "Social Space")
+    end
+})
+
+ServerTab:Button({
+    Title = "Join Player Nextbots",
+    Desc = "Join the most populated Player Nextbots server",
+    Icon = "ghost",
+    Callback = function()
+        joinServerByPlaceId(121271605799901, "Player Nextbots")
+    end
+})
+
+ServerTab:Button({
+    Title = "Join VC Only",
+    Desc = "Join the most populated VC Only server",
+    Icon = "mic",
+    Callback = function()
+        joinServerByPlaceId(10808838353, "VC Only")
+    end
+})
+
+ServerTab:Button({
+    Title = "Join Pro",
+    Desc = "Join the most populated Pro server",
+    Icon = "award",
+    Callback = function()
+        joinServerByPlaceId(11353528705, "Pro")
+    end
+})
+
+ServerTab:Divider()
+
+local customServerCode = ""
+
+ServerTab:Input({
+    Title = "Custom Server Code",
+    Placeholder = "Enter custom server passcode",
+    Value = "",
+    Callback = function(value)
+        customServerCode = value
+    end
+})
+
+ServerTab:Button({
+    Title = "Join Custom Server",
+    Desc = "Join custom server with the code above",
+    Icon = "key",
+    Callback = function()
+        if customServerCode == "" then
+            ObsidianUI:Notify({
+                Title = "Join Failed",
+                Content = "Please enter a custom server code!",
+                Duration = 3
+            })
+            return
+        end
+
+        local success, result = pcall(function()
+            return game:GetService("ReplicatedStorage"):WaitForChild("Events"):WaitForChild("CustomServers")
+                :WaitForChild("JoinPasscode"):InvokeServer(customServerCode)
+        end)
+
+        if success then
+            ObsidianUI:Notify({
+                Title = "Joining Custom Server",
+                Content = "Attempting to join with code: " .. customServerCode,
+                Duration = 3
+            })
+        else
+            ObsidianUI:Notify({
+                Title = "Join Failed",
+                Content = "Invalid code or server unavailable!",
+                Duration = 3
+            })
+        end
+    end
+})
+
+
+ServerTab:Divider()
+
+-- -------------------------------------------------------------------------- --
+--                                  TAB MISC                                  --
+-- -------------------------------------------------------------------------- --
+
+-- -------------------------------------------------------------------------- --
+--                             ANTI LAG MODULE                                --
+-- -------------------------------------------------------------------------- --
+
+local AntiLagModule = (function()
+    local function applyFPSBoost()
+        Success("FPS Boost", "Applying aggressive optimizations...", 2)
+        local Lighting = game:GetService("Lighting")
+        local Terrain = workspace:FindFirstChildOfClass("Terrain")
+        Lighting.GlobalShadows = false
+        Lighting.FogEnd = 1e10
+        Lighting.Brightness = 1
+        if Terrain then
+            Terrain.WaterWaveSize = 0
+            Terrain.WaterWaveSpeed = 0
+            Terrain.WaterReflectance = 0
+            Terrain.WaterTransparency = 1
+        end
+
+        for _, obj in ipairs(workspace:GetDescendants()) do
+            if obj:IsA("BasePart") then
+                obj.Material = Enum.Material.Plastic
+                obj.Reflectance = 0
+            elseif obj:IsA("Decal") or obj:IsA("Texture") then
+                obj:Destroy()
+            elseif obj:IsA("ParticleEmitter") or obj:IsA("Trail") then
+                obj:Destroy()
+            elseif obj:IsA("PointLight") or obj:IsA("SpotLight") or obj:IsA("SurfaceLight") then
+                obj:Destroy()
+            end
+        end
+
+        for _, plr in ipairs(Players:GetPlayers()) do
+            local char = plr.Character
+            if char then
+                for _, part in ipairs(char:GetDescendants()) do
+                    if part:IsA("Accessory") or part:IsA("Clothing") then
+                        part:Destroy()
+                    end
+                end
+            end
+        end
+
+        Success("FPS Boost", "Optimizations applied successfully!", 2)
+    end
+
+    local function applyAntiLag1()
+        Success("Anti Lag 1", "Applying material optimizations...", 2)
+
+        local Lighting = game:GetService("Lighting")
+        local Terrain = workspace:FindFirstChildOfClass("Terrain")
+
+        Lighting.GlobalShadows = false
+        Lighting.FogEnd = 1e10
+        Lighting.Brightness = 1
+
+        if Terrain then
+            Terrain.WaterWaveSize = 0
+            Terrain.WaterWaveSpeed = 0
+            Terrain.WaterReflectance = 0
+            Terrain.WaterTransparency = 1
+        end
+
+        for _, obj in ipairs(workspace:GetDescendants()) do
+            if obj:IsA("BasePart") then
+                obj.Material = Enum.Material.Plastic
+                obj.Reflectance = 0
+            elseif obj:IsA("Decal") or obj:IsA("Texture") then
+                obj:Destroy()
+            elseif obj:IsA("ParticleEmitter") or obj:IsA("Trail") then
+                obj:Destroy()
+            elseif obj:IsA("PointLight") or obj:IsA("SpotLight") or obj:IsA("SurfaceLight") then
+                obj:Destroy()
+            end
+        end
+
+        for _, plr in ipairs(Players:GetPlayers()) do
+            local char = plr.Character
+            if char then
+                for _, part in ipairs(char:GetDescendants()) do
+                    if part:IsA("Accessory") or part:IsA("Clothing") then
+                        part:Destroy()
+                    end
+                end
+            end
+        end
+
+        Success("Anti Lag 1", "Material optimizations complete!", 2)
+    end
+
+
+    local function applyAntiLag2()
+        Success("Anti Lag 2", "Disabling visual effects...", 2)
+
+        local settings = {
+            Textures = true,
+            VisualEffects = true,
+            Parts = true,
+            Particles = true,
+            Spot = true
+        }
+
+        for _, v in next, game:GetDescendants() do
+            if settings.Parts then
+                if v:IsA("Part") or v:IsA("UnionOperation") or v:IsA("BasePart") then
+                    v.Material = Enum.Material.SmoothPlastic
+                end
+            end
+
+            if settings.Particles then
+                if v:IsA("ParticleEmitter") or v:IsA("Smoke") or v:IsA("Explosion") or v:IsA("Sparkles") or v:IsA("Fire") then
+                    v.Enabled = false
+                end
+            end
+
+            if settings.VisualEffects then
+                if v:IsA("BloomEffect") or v:IsA("BlurEffect") or v:IsA("DepthOfFieldEffect") or v:IsA("SunRaysEffect") then
+                    v.Enabled = false
+                end
+            end
+
+            if settings.Textures then
+                if v:IsA("Decal") or v:IsA("Texture") then
+                    v.Texture = ""
+                end
+            end
+
+
+            if settings.Sky then
+                if v:IsA("Sky") then
+                    v.Parent = nil
+                end
+            end
+        end
+
+        Success("Anti Lag 2", "Visual effects disabled!", 2)
+    end
+
+    local function applyRemoveTexture()
+        for _, part in ipairs(workspace:GetDescendants()) do
+            if part:IsA("Part") or part:IsA("MeshPart") or part:IsA("UnionOperation") or part:IsA("WedgePart") or part:IsA("CornerWedgePart") then
+                if part:IsA("Part") then
+                    part.Material = Enum.Material.SmoothPlastic
+                end
+                if part:FindFirstChildWhichIsA("Texture") then
+                    local texture = part:FindFirstChildWhichIsA("Texture")
+                    texture.Texture = "rbxassetid://0"
+                end
+                if part:FindFirstChildWhichIsA("Decal") then
+                    local decal = part:FindFirstChildWhichIsA("Decal")
+                    decal.Texture = "rbxassetid://0"
+                end
+            end
         end
     end
 
+
+    return {
+        ApplyFPSBoost = applyFPSBoost,
+        ApplyAntiLag1 = applyAntiLag1,
+        ApplyAntiLag2 = applyAntiLag2,
+        ApplyRemoveTexture = applyRemoveTexture
+    }
+end)()
+
+-- -------------------------- HELPER FUNCTION MISC -------------------------- --
+
+
+local originalBrightness = game:GetService("Lighting").Brightness
+local originalOutdoorAmbient = game:GetService("Lighting").OutdoorAmbient
+local originalAmbient = game:GetService("Lighting").Ambient
+local originalGlobalShadows = game:GetService("Lighting").GlobalShadows
+local originalFogEnd = game:GetService("Lighting").FogEnd
+local originalFogStart = game:GetService("Lighting").FogStart
+
+
+local function applyFullBrightness()
+    game:GetService("Lighting").Brightness = 2
+    game:GetService("Lighting").OutdoorAmbient = Color3.fromRGB(255, 255, 255)
+    game:GetService("Lighting").Ambient = Color3.fromRGB(255, 255, 255)
+    game:GetService("Lighting").GlobalShadows = false
+end
+
+local function removeFullBrightness()
+    game:GetService("Lighting").Brightness = originalBrightness
+    game:GetService("Lighting").OutdoorAmbient = originalOutdoorAmbient
+    game:GetService("Lighting").Ambient = originalAmbient
+    game:GetService("Lighting").GlobalShadows = originalGlobalShadows
+end
+
+local function applySuperFullBrightness()
+    game:GetService("Lighting").Brightness = 15
+    game:GetService("Lighting").OutdoorAmbient = Color3.fromRGB(255, 255, 255)
+    game:GetService("Lighting").Ambient = Color3.fromRGB(255, 255, 255)
+    game:GetService("Lighting").GlobalShadows = false
+end
+
+local function applyNoFog()
+    game:GetService("Lighting").FogEnd = 1000000
+    game:GetService("Lighting").FogStart = 999999
+end
+
+local function removeNoFog()
+    game:GetService("Lighting").FogEnd = originalFogEnd
+    game:GetService("Lighting").FogStart = originalFogStart
+end
+
+local AntiAFKConnection
+
+local function startAntiAFK()
+    AntiAFKConnection = player.Idled:Connect(function()
+        VirtualUser:Button2Down(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
+        task.wait(1)
+        VirtualUser:Button2Up(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
+    end)
+end
+
+local function stopAntiAFK()
+    if AntiAFKConnection then
+        AntiAFKConnection:Disconnect()
+        AntiAFKConnection = nil
+    end
+end
+
+-- ------------------------------- TAB UI MISC ------------------------------ --
+local MiscTab = Window:Tab({
+    Icon = "settings",
+    Title = "Misc"
 })
 
-local InfoTab = Window:Tab({ Icon = "info", Title = "Info" })
+MiscTab:Divider()
+MiscTab:Section({ Title = "Performance Optimization", TextSize = 20 })
+MiscTab:Divider()
 
-InfoTab:Section({ Title = "Discord", TextSize = 20 })
-
-InfoTab:Button({
-    Title = "Copy Discord Invite",
-    Description = "https://discord.gg/kJ552CMBx4",
+MiscTab:Button({
+    Title = "FPS Boost",
+    Desc = "Most aggressive optimization (removes all lag)",
+    Icon = "zap",
     Callback = function()
-        pcall(function() setclipboard("https://discord.gg/kJ552CMBx4") end)
-        notify("Discord", "Invite link copied to clipboard!", 2)
+        AntiLagModule.ApplyFPSBoost()
     end
 })
 
-InfoTab:Divider()
-
-InfoTab:Section({ Title = "Credits", TextSize = 20 })
-
-InfoTab:Paragraph({
-    Title = "Project",
-    Desc = "Bagah Project"
+MiscTab:Button({
+    Title = "Anti Lag 1",
+    Desc = "Aggressive material and effect removal",
+    Icon = "trending-up",
+    Callback = function()
+        AntiLagModule.ApplyAntiLag1()
+    end
 })
 
-InfoTab:Paragraph({
-    Title = "Script by",
-    Desc = "ahmuq"
+MiscTab:Button({
+    Title = "Anti Lag 2",
+    Desc = "Disable visual effects and textures",
+    Icon = "sliders",
+    Callback = function()
+        AntiLagModule.ApplyAntiLag2()
+    end
 })
 
-AntiAfk.Enabled = true
-startAntiAfk()
+MiscTab:Button({
+    Title = "Remove Texture",
+    Desc = "Remove all textures",
+    Icon = "sliders",
+    Callback = function()
+        AntiLagModule.ApplyRemoveTexture()
+    end
+})
 
-local function unloadBagah()
-    AutoExecuteOnTeleport = false
-    AutoParry.PerfectEnabled = false
-    AutoParry.AnimationSyncEnabled = false
-    AutoParry.GrappleAwareEnabled = false
-    AutoParry.AutoPunishEnabled = false
-    AutoParry.FacingEnabled = false
-    AutoParry.FaceLockEnabled = false
-    AutoParry.BlockM1Enabled = false
-    AutoParry.BlockM1Active = false
-    AutoParry.ComboHoldEnabled = false
-    AutoParry.FacingCheckEnabled = false
-    AutoParry.FallbackBlockEnabled = false
-    AutoParry.ParryToken += 1
-    table.clear(AutoParry.PendingParry)
-    releaseBlock()
-    stopFaceLock()
-    refreshAnimationWatchers()
+MiscTab:Section({ Title = "Visual Enhancements", TextSize = 20 })
+MiscTab:Divider()
 
-    setRhythmEnabled(false)
-    stopFly()
-    Noclip.Enabled = false
-    disableNoclip()
-    HUD.ShowHealth = false
-    HUD.ShowStamina = false
-    stopHud()
-    stopAntiAfk()
-    stopRuntimeProfiler()
-    ESP.ShowBox = false
-    ESP.ShowHealth = false
-    ESP.ShowStamina = false
-    ESP.ShowTracer = false
-    ESP.ShowInfo = false
-    ESP.ShowHighlight = false
-    local espModels = {}
-    for model in pairs(ESP.Objects) do table.insert(espModels, model) end
-    for _, model in ipairs(espModels) do espClearModel(model) end
-    espClearHighlights()
-    setInfiniteStamina(false)
-    setNoDodgeCooldown(false)
-    setAntiStun(false)
-    setAntiRagdoll(false)
-    Dbg.Events = false
-    Dbg.StunEvents = false
-    disconnectStunDebugConnections()
+MiscTab:Toggle({
+    Title = "Full Brightness",
+    Desc = "Brighten the game",
+    Flag = "FullBrightnessToggle",
+    Value = false,
+    Callback = function(state)
+        if state then
+            applyFullBrightness()
+        else
+            removeFullBrightness()
+        end
+    end
+})
+
+MiscTab:Toggle({
+    Title = "Super Full Brightness",
+    Desc = "Brighten the game",
+    Flag = "SuperFullBrightnessToggle",
+    Value = false,
+    Callback = function(state)
+        if state then
+            applySuperFullBrightness()
+        else
+            removeFullBrightness()
+        end
+    end
+})
+
+MiscTab:Toggle({
+    Title = "No Fog",
+    Desc = "Remove all fog",
+    Flag = "NoFogToggle",
+    Value = false,
+    Callback = function(state)
+        if state then
+            applyNoFog()
+        else
+            removeNoFog()
+        end
+    end
+})
+
+MiscTab:Toggle({
+    Title = "FPS Display",
+    Desc = "Show FPS, Ping, Mem, and CPU stats",
+    Flag = "FPSDisplayToggle",
+    Value = false,
+    Callback = function(state)
+        if state then
+            local success, err = pcall(function()
+                loadstring(game:HttpGet(
+                    "https://raw.githubusercontent.com/Bagah-Project/bagah-hub-public/refs/heads/main/universal/fps_display.lua"))()
+            end)
+            if success then
+                Success("FPS Display", "Performance monitor loaded!", 2)
+            else
+                Error("FPS Display", "Failed to load script: " .. tostring(err), 2)
+            end
+        else
+            local success, err = pcall(function()
+                local pg = game:GetService("Players").LocalPlayer:WaitForChild("PlayerGui")
+                local gui = pg:FindFirstChild("BagahHub_FPSDisplay")
+                if gui then
+                    gui:Destroy()
+                end
+            end)
+            Info("FPS Display", "Performance monitor hidden", 2)
+        end
+    end
+})
+
+MiscTab:Divider()
+MiscTab:Section({ Title = "Utilities", TextSize = 20 })
+MiscTab:Divider()
+
+
+MiscTab:Toggle({
+    Title = "Anti-AFK",
+    Desc = "Prevent auto-kick",
+    Flag = "AntiAfkToggle",
+    Value = featureStates.AntiAFK,
+    Callback = function(state)
+        featureStates.AntiAFK = state
+        if state then
+            startAntiAFK()
+        else
+            stopAntiAFK()
+        end
+    end
+})
+
+if featureStates.AntiAFK then
+    startAntiAFK()
+end
+
+MiscTab:Button({
+    Title = "Remove Invisible Walls",
+    Desc = "Remove all invisible barriers in the map",
+    Icon = "trash-2",
+    Callback = function()
+        local mapFolder = workspace:FindFirstChild("Map")
+        if mapFolder then
+            local invisParts = mapFolder:FindFirstChild("InvisParts")
+            if invisParts then
+                local count = 0
+                for _, wall in pairs(invisParts:GetChildren()) do
+                    wall:Destroy()
+                    count = count + 1
+                end
+                Success("Removed " .. count .. " invisible walls!")
+            else
+                Error("InvisParts folder not found!")
+            end
+        end
+    end
+})
+
+MiscTab:Input({
+    Title = "Set FOV",
+    Desc = "Set FOV value (0-120)",
+    Placeholder = "Enter FOV value (0-120)",
+    Value = "",
+    Callback = function(value)
+        local num = tonumber(value)
+        if num then
+            ChangeSettingRemote:InvokeServer(2, num)
+            UpdatedEvent:Fire(2, num)
+            Success("FOV set to: " .. num, "FOV set to: " .. num, 2)
+        end
+    end
+})
+
+MiscTab:Toggle({
+    Title = "Toggle Exchange Menu",
+    Desc = "Show/hide event exchange menu",
+    Value = false,
+    Callback = function(state)
+        local success, err = pcall(function()
+            player.PlayerGui.Menu.Views.Battlepass.Exchange.Visible = state
+        end)
+        if not success then
+            warn("Exchange menu not found:", err)
+        end
+    end
+})
+
+
+
+MiscTab:Divider()
+MiscTab:Section({ Title = "Lag Switch", TextSize = 20 })
+MiscTab:Divider()
+
+local lagSwitchMethod = "Metode 1"
+local lagSwitchDuration = 0.5
+local lagSwitchKey = Enum.KeyCode.L
+local lagSwitchGui = nil
+local setfflag = rawget(_G, "setfflag")
+local lagSwitchButton = nil
+
+local function triggerLagSwitch()
+    local duration = lagSwitchDuration
+    local method = lagSwitchMethod
+    task.spawn(function()
+        if method == "Metode 1" then
+            pcall(function() setfflag("MaxMissedWorldStepsRemembered", "1") end)
+            local start = tick()
+            while tick() - start < duration do
+                local a = math.random(1, 1000000) * math.random(1, 1000000)
+                a = a / math.random(1, 10000)
+            end
+        elseif method == "Metode 2" then
+            pcall(function() setfflag("MaxMissedWorldStepsRemembered", "10000001000000") end)
+            local start = os.clock()
+            while os.clock() - start < duration do end
+        end
+    end)
+end
+
+local lagSwitchKeyConn = UserInputService.InputBegan:Connect(function(input, processed)
+    if processed then return end
+    if input.KeyCode == lagSwitchKey then
+        triggerLagSwitch()
+    end
+end)
+
+local function setLagButtonVisible(visible)
+    if not UserInputService.TouchEnabled then return end
+    if not visible then
+        if lagSwitchGui then lagSwitchGui:Destroy(); lagSwitchGui = nil; lagSwitchButton = nil end
+        return
+    end
+    if lagSwitchGui then return end
+    lagSwitchGui = Instance.new("ScreenGui")
+    lagSwitchGui.Name = "BagahHubLagSwitch"
+    lagSwitchGui.ResetOnSpawn = false
+    lagSwitchGui.DisplayOrder = 999
+    lagSwitchGui.Parent = PlayerGui
+    lagSwitchButton = Instance.new("TextButton")
+    lagSwitchButton.Name = "LagButton"
+    lagSwitchButton.AnchorPoint = Vector2.new(0.5, 0.5)
+    lagSwitchButton.Position = UDim2.new(0.82, 0, 0.55, 0)
+    lagSwitchButton.Size = UDim2.fromOffset(110, 42)
+    lagSwitchButton.BackgroundColor3 = Color3.fromRGB(54, 45, 20)
+    lagSwitchButton.TextColor3 = Color3.fromRGB(250, 204, 21)
+    lagSwitchButton.Font = Enum.Font.GothamBold
+    lagSwitchButton.TextSize = 14
+    lagSwitchButton.Text = "LAG"
+    lagSwitchButton.Parent = lagSwitchGui
+    Instance.new("UICorner", lagSwitchButton).CornerRadius = UDim.new(0, 8)
+    local dragInput, dragStart, startPosition, moved, suppressClick
+    lagSwitchButton.InputBegan:Connect(function(input)
+        if input.UserInputType ~= Enum.UserInputType.Touch then return end
+        dragInput = input
+        dragStart = input.Position
+        startPosition = lagSwitchButton.Position
+        moved = false
+    end)
+    local dragConn = UserInputService.InputChanged:Connect(function(input)
+        if input ~= dragInput then return end
+        local delta = input.Position - dragStart
+        if delta.Magnitude > 8 then moved = true end
+        lagSwitchButton.Position = UDim2.new(startPosition.X.Scale, startPosition.X.Offset + delta.X,
+            startPosition.Y.Scale, startPosition.Y.Offset + delta.Y)
+    end)
+    local endConn = UserInputService.InputEnded:Connect(function(input)
+        if input == dragInput then
+            dragInput = nil
+            suppressClick = moved
+        end
+    end)
+    lagSwitchGui.Destroying:Connect(function()
+        dragConn:Disconnect()
+        endConn:Disconnect()
+    end)
+    lagSwitchButton.Activated:Connect(function()
+        if suppressClick then suppressClick = false; return end
+        triggerLagSwitch()
+    end)
+end
+
+MiscTab:Dropdown({
+    Title = "Lag Method",
+    Flag = "LagMethodDropdown",
+    Values = { "Metode 1", "Metode 2" },
+    Value = "Metode 1",
+    Callback = function(value)
+        lagSwitchMethod = value
+    end
+})
+
+MiscTab:Slider({
+    Title = "Lag Duration (s)",
+    Flag = "LagDurationSlider",
+    Value = { Min = 1, Max = 5, Default = 1, Step = 1 },
+    Callback = function(value)
+        lagSwitchDuration = value / 10
+    end
+})
+
+MiscTab:Input({
+    Title = "Lag Keybind (PC)",
+    Flag = "LagKeybindInput",
+    Desc = "Key name to trigger lag switch (e.g. L, G, F, V)",
+    Placeholder = "L",
+    Value = "L",
+    Callback = function(value)
+        local keyName = tostring(value):gsub("%s+", ""):upper()
+        local ok, keyCode = pcall(function() return Enum.KeyCode[keyName] end)
+        if ok and keyCode then
+            lagSwitchKey = keyCode
+        end
+    end
+})
+
+MiscTab:Button({
+    Title = "Trigger Lag Switch",
+    Desc = "Freeze client briefly (PC keybind: L)",
+    Icon = "zap",
+    Callback = triggerLagSwitch
+})
+
+MiscTab:Toggle({
+    Title = "Show Lag Button",
+    Flag = "ShowLagButton",
+    Desc = "Mobile-only on-screen button for Lag Switch",
+    Value = false,
+    Callback = function(state)
+        setLagButtonVisible(state)
+    end
+})
+
+MiscTab:Divider()
+MiscTab:Section({ Title = "Community", TextSize = 20 })
+MiscTab:Divider()
+
+MiscTab:Button({
+    Title = "Join Discord Server",
+    Desc = "Copy Discord invite link",
+    Icon = "message-circle",
+    Callback = function()
+        local discordLink = "https://discord.gg/kJ552CMBx4"
+        local success = pcall(function()
+            setclipboard(discordLink)
+        end)
+
+        if success then
+            Success("Discord Link Copied!", "Discord link copied to clipboard!", 2)
+        else
+            Error("Copy Failed", "Your executor doesn't support clipboard", 2)
+            warn("Discord Link:", discordLink)
+        end
+    end
+})
+
+
+
+
+-- -------------------------------------------------------------------------- --
+--                              FINAL SETUP                                   --
+-- -------------------------------------------------------------------------- --
+
+local function unloadEvade()
+    State.Player.FlyEnabled = false
+    State.Player.NoclipEnabled = false
+    State.Player.SpeedEnabled = false
+    State.Player.BhopHoldEnabled = false
+    State.Player.BhopToggleEnabled = false
+    pcall(FlyingModule.Stop)
+    pcall(NoclipModule.Disable)
+    pcall(CFrameSpeedModule.Stop)
+    pcall(BhopModule.Stop)
+    pcall(BhopToggleModule.Stop)
+
+    autoVoteEnabled = false
+    autoVoteModeEnabled = false
+    if voteConnection then task.cancel(voteConnection); voteConnection = nil end
+    if voteModeConnection then task.cancel(voteModeConnection); voteModeConnection = nil end
+    pcall(AutoSelfReviveModule.Stop)
+    pcall(AutoRespawnWatchAd.Stop)
+    pcall(AutoCarryModule.Stop)
+    pcall(AutoCarryModule.SetButtonVisible, AutoCarryModule, false)
+    pcall(VipMenuModule.SetAutoEnabled, false)
+    featureStates.TimerDisplay = false
+    featureStates.AntiAFK = false
+    pcall(stopAntiAFK)
+pcall(function()
+        local fpsGui = player.PlayerGui:FindFirstChild("BagahHub_FPSDisplay")
+        if fpsGui then fpsGui:Destroy() end
+    end)
+    if lagSwitchKeyConn then lagSwitchKeyConn:Disconnect(); lagSwitchKeyConn = nil end
+    if lagSwitchGui then lagSwitchGui:Destroy(); lagSwitchGui = nil; lagSwitchButton = nil end
     Library:Unload()
 end
 
 local ConfigTab = ObsidianWindow:AddTab("Configs", "folder-cog")
-SaveManager:SetLibrary(Library)
-SaveManager:IgnoreThemeSettings()
-SaveManager:SetFolder("BagahHubGakuran")
-SaveManager:SetSubFolder("Gakuran-" .. tostring(game.PlaceId))
 SaveManager:BuildConfigSection(ConfigTab)
-SaveManager:LoadAutoloadConfig()
 ConfigTab:AddRightGroupbox("Script"):AddButton({
     Text = "Unload Bagah",
-    Tooltip = "Disable all Bagah features and close the UI",
-    Func = unloadBagah,
+    Tooltip = "Disable active Bagah features and close the UI",
+    Func = unloadEvade,
 })
-
+SaveManager:LoadAutoloadConfig()
 
 Window:SelectTab(1)
-
--- ========================================================================= --
---                               ESP RENDER LOOP                              --
--- ========================================================================= --
-task.spawn(function()
-    while true do
-        if espHasEnabledFeature() then
-            local profileStartedAt = RuntimeProfiler.Enabled and os.clock() or nil
-            espRender()
-            if profileStartedAt then
-                RuntimeProfiler.EspFrames += 1
-                RuntimeProfiler.EspTime += os.clock() - profileStartedAt
-            end
-        end
-        task.wait(0.033) -- ~30fps, 2D drawings don't need 60fps
-    end
-end)
-
-
--- ========================================================================= --
---                            NOTIFICATION HELPER                             --
--- ========================================================================= --
-notify = function(title, text, duration)
-    ObsidianUI:Notify({
-        Title = title,
-        Content = text,
-        Duration = duration or 2,
-    })
-end
-
--- ========================================================================= --
---                               INITIALIZED                                  --
--- ========================================================================= --
-notify("BagahHub - Gakuran", "Script Loaded !", 3)
+Success("Script Loaded", "BagahHub Evade loaded successfully!", 3)
