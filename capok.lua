@@ -1364,7 +1364,7 @@ local Rhythm    = {
     HitWindow = UserInputService.TouchEnabled and 0.12 or 0.08,
     MinInterval = 0.015,
     NoteTravelTime = 2.5,
-    TouchLeadTime = 0.06,
+    TouchLeadTime = 0.035, -- virtual touch reaches the game roughly 30-45ms after SendTouchEvent
     Generation = 0,
     TouchMode = UserInputService.TouchEnabled,
     TouchPositions = {},
@@ -2643,6 +2643,9 @@ end
 
 local function rhythmGetPressLead()
     local leadMs = Rhythm.PressLeadMs or 0
+    if Rhythm.TouchMode then
+        leadMs += (Rhythm.TouchLeadTime or 0) * 1000
+    end
     if Rhythm.LaneCount == 2 then
         leadMs += Rhythm.TwoLaneLeadMs or 0
     end
