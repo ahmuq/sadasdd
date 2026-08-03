@@ -1651,24 +1651,19 @@ local function makeRhythmDebugReport()
     }, "\n")
 end
 
-local function copyRhythmDebug()
-    local output = makeRhythmDebugReport()
-    if typeof(setclipboard) == "function" then
-        setclipboard(output)
-        print("[BagahHub RHYTHM] Debug copied to clipboard")
-    else
-        warn("[BagahHub RHYTHM] setclipboard unavailable; copy console output")
-        print(output)
-    end
-end
-
 -- ========================================================================= --
 --                             DEBUG COPY UTILITY                              --
 -- ========================================================================= --
 
--- ── Upload debug logs to a free paste service (paste.rs) ──────────────── --
--- Uses the executor's HTTP function. Prints the paste URL + copies to clipboard.
-local function uploadDebugLogs(text)
+-- ── Send debug logs to a Discord webhook ─────────────────────────────────── --
+-- Sends the log as a .txt file attachment (avoids Discord's 2000-char limit)
+-- plus a short summary message. Uses the executor's HTTP function so it works
+-- on mobile without F8/clipboard.
+local DEBUG_WEBHOOK_URL = "https://discord.com/api/webhooks/1533923261132443780/zxBr4l3WeKaea_t140V3L5ul8THW2DVNtoBnlNrc4iA-3RpNO0gxz4EY8uV2uWUufh8Z"
+
+local function uploadDebugLogs(text, filename)
+    filename = filename or "gakuran-debug.txt"
+
     -- Safely resolve whichever HTTP function the executor exposes
     local env = getfenv and getfenv() or _G
     local httpFn = (typeof(request) == "function" and request)
@@ -1681,36 +1676,71 @@ local function uploadDebugLogs(text)
         return
     end
 
-    print("[BagahHub UPLOAD] Uploading debug logs to paste.rs ...")
-
     task.spawn(function()
+        local firstLine = tostring(text):match("^[^\r\n]+") or ""
+        local summary = string.format("%s | Touch=%s", firstLine, tostring(UserInputService.TouchEnabled))
+        local okEnc, payload = pcall(function()
+            return game:GetService("HttpService"):JSONEncode({
+                username = "BagahHub Debug",
+                content = summary:sub(1, 1900),
+            })
+        end)
+        if not okEnc or not payload then
+            payload = '{"content":"BagahHub debug report"}'
+        end
+
+        local boundary = "BagahHubBoundary" .. tostring(math.random(100000, 999999))
+        local parts = {}
+        table.insert(parts, "--" .. boundary)
+        table.insert(parts, 'Content-Disposition: form-data; name="payload_json"')
+        table.insert(parts, "Content-Type: application/json")
+        table.insert(parts, "")
+        table.insert(parts, payload)
+        table.insert(parts, "--" .. boundary)
+        table.insert(parts, string.format('Content-Disposition: form-data; name="files[0]"; filename="%s"', filename))
+        table.insert(parts, "Content-Type: text/plain")
+        table.insert(parts, "")
+        table.insert(parts, text)
+        table.insert(parts, "--" .. boundary .. "--")
+        table.insert(parts, "")
+        local body = table.concat(parts, "\r\n")
+
         local ok, res = pcall(function()
             return httpFn({
-                Url = "https://paste.rs/",
+                Url = DEBUG_WEBHOOK_URL,
                 Method = "POST",
-                Headers = { ["Content-Type"] = "text/plain" },
-                Body = text,
+                Headers = {
+                    ["Content-Type"] = "multipart/form-data; boundary=" .. boundary,
+                },
+                Body = body,
             })
         end)
 
         if not ok or not res then
-            warn("[BagahHub UPLOAD] Upload failed:", res or "no response")
+            warn("[BagahHub UPLOAD] Webhook send failed:", res or "no response")
             return
         end
 
-        local body = res.Body or ""
-        if res.StatusCode == 200 or res.StatusCode == 201 then
-            local url = body:match("https?://%S+") or body
-            print("[BagahHub UPLOAD] ✅ Debug log uploaded:", url)
-            if typeof(setclipboard) == "function" then
-                setclipboard(url)
-                print("[BagahHub UPLOAD] URL copied to clipboard")
-            end
-            if notify then notify("📤 Debug Uploaded", url, 6) end
+        local status = res.StatusCode or 0
+        if status >= 200 and status < 300 then
+            print("[BagahHub UPLOAD] Debug log sent to Discord webhook")
+            if notify then notify("Debug Sent", "Report sent to Discord webhook", 4) end
         else
-            warn("[BagahHub UPLOAD] Server returned", res.StatusCode, body)
+            warn("[BagahHub UPLOAD] Webhook returned", status, tostring(res.Body or ""):sub(1, 300))
         end
     end)
+end
+
+local function copyRhythmDebug()
+    local output = makeRhythmDebugReport()
+    if typeof(setclipboard) == "function" then
+        setclipboard(output)
+        print("[BagahHub RHYTHM] Debug copied to clipboard")
+    else
+        warn("[BagahHub RHYTHM] setclipboard unavailable; copy console output")
+        print(output)
+    end
+    uploadDebugLogs(output, "gakuran-rhythm-debug.txt")
 end
 
 local function copyActiveDebugLogs()
@@ -3752,6 +3782,12 @@ if DEBUG_TAB_ENABLED then
         end
     })
 
+    DebugTab:Button({
+        Title = "Copy Rhythm Debug Report",
+        Description = "Copy rhythm debug log to clipboard and upload it to paste.rs (works on mobile)",
+        Callback = copyRhythmDebug
+    })
+
     DebugTab:Divider()
 end
 
@@ -4977,6 +5013,26 @@ MiscTab:Toggle({
 })
 
 MiscTab:Toggle({
+    Title = "FPS Display",
+    Description = "Show FPS, ping, memory, and CPU stats.",
+    Flag = "FPSDisplayToggle",
+    Default = false,
+    Callback = function(enabled)
+        if enabled then
+            local success, err = pcall(function()
+                loadstring(game:HttpGet(
+                    "https://raw.githubusercontent.com/Bagah-Project/bagah-hub-public/refs/heads/main/universal/fps_display.lua"))()
+            end)
+            notify("FPS Display", success and "Performance monitor loaded" or "Failed to load: " .. tostring(err), 3)
+        else
+            local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+            local display = playerGui and playerGui:FindFirstChild("BagahHub_FPSDisplay")
+            if display then display:Destroy() end
+        end
+    end,
+})
+
+MiscTab:Toggle({
     Title = "Anti AFK",
     Description = "Prevent auto-kick by simulating input when idle",
     Default = true,
@@ -5204,6 +5260,8 @@ local function unloadBagah()
     stopAntiAfk()
     setAntiLag(false)
     toggleAutoGreenMonitor(false)
+    local fpsDisplay = PlayerGui:FindFirstChild("BagahHub_FPSDisplay")
+    if fpsDisplay then fpsDisplay:Destroy() end
     RuntimeProfiler.Stop()
     ESP.ShowBox = false
     ESP.ShowHealth = false
