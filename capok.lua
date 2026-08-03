@@ -1649,6 +1649,19 @@ local function makeRhythmDebugReport()
             local ok, inset = pcall(function() return GuiService:GetGuiInset() end)
             return ok and tostring(inset) or "pcall failed"
         end)(),
+        "UIIgnoreInset: " .. (function()
+            local ok, ui = pcall(function() return PlayerGui:FindFirstChild("RhythmServiceUI") end)
+            if not ok or not ui or not ui:IsA("ScreenGui") then return "no-ui" end
+            return tostring(ui.IgnoreGuiInset)
+        end)(),
+        "ResolvedInset: " .. (function()
+            local ok, ui = pcall(function() return PlayerGui:FindFirstChild("RhythmServiceUI") end)
+            if ok and ui and ui:IsA("ScreenGui") and ui.IgnoreGuiInset then
+                return "0, 0 (UI ignores inset)"
+            end
+            local ok2, inset = pcall(function() return GuiService:GetGuiInset() end)
+            return ok2 and tostring(inset) .. " (inset applied)" or "pcall failed"
+        end)(),
         "ViewSize: " .. (function()
             local ok, cam = pcall(function() return workspace.CurrentCamera end)
             return ok and cam and tostring(cam.ViewportSize) or "none"
@@ -2238,6 +2251,22 @@ LocalPlayer.CharacterAdded:Connect(function(character)
     end
 end)
 
+-- Resolve the screen-space offset that converts a GuiObject's AbsolutePosition
+-- into VirtualInputManager touch coordinates. Normally that is
+-- GuiService:GetGuiInset(), but only when the rhythm ScreenGui respects the
+-- inset. If it sets IgnoreGuiInset (fullscreen), AbsolutePosition already
+-- equals screen coordinates and adding the inset sends every tap below the
+-- receptors — causing all notes to MISS (seen on Poco F7 with a 58px inset).
+local function rhythmTouchInset()
+    local ui = PlayerGui:FindFirstChild("RhythmServiceUI")
+    if ui and ui:IsA("ScreenGui") and ui.IgnoreGuiInset then
+        return Vector2.zero
+    end
+    local inset = Vector2.zero
+    pcall(function() inset = GuiService:GetGuiInset() end)
+    return inset
+end
+
 local function rhythmReleaseAll()
     for lane, key in ipairs(Rhythm.Keys) do
         Rhythm.Tokens[key.Name] = nil
@@ -2245,7 +2274,7 @@ local function rhythmReleaseAll()
         local position = Rhythm.TouchPositions[lane]
         if position then
             pcall(function()
-                local inset = Rhythm.TouchCorrection or GuiService:GetGuiInset()
+                local inset = Rhythm.TouchCorrection or rhythmTouchInset()
                 VirtualInputManager:SendTouchEvent(lane, 2,
                     position.X + inset.X, position.Y + inset.Y)
             end)
@@ -2281,13 +2310,7 @@ local function rhythmSendInput(lane, key, pressed)
             math.floor(receptor.AbsolutePosition.Y + receptor.AbsoluteSize.Y / 2)
         )
         if pressed then Rhythm.TouchPositions[lane] = position end
-        local correction = Rhythm.TouchCorrection
-        if not correction then
-            correction = Vector2.zero
-            pcall(function()
-                correction = GuiService:GetGuiInset()
-            end)
-        end
+        local correction = Rhythm.TouchCorrection or rhythmTouchInset()
         local inputPosition = position + correction
         if pressed and not Rhythm.TouchCorrection
             and next(Rhythm.PendingTouches) == nil then
