@@ -28,7 +28,6 @@ local SprintRemote          = RemotesFolder:FindFirstChild("Sprint")
 local SprintUpdateRemote    = RemotesFolder:FindFirstChild("SprintUpdate")
 local InstrumentPianoRemote = RemotesFolder:FindFirstChild("InstrumentPiano")
 local BasketballShootRemote = RemotesFolder:FindFirstChild("BasketballShoot")
-local AutoGreenShoot        = false
 local toggleAutoGreenMonitor
 
 do
@@ -232,10 +231,6 @@ local Dbg = {
     StunStartedAt = os.clock(),
 }
 
-local EspHealthDebug = { Enabled = false, LastState = {}, Timeline = {} }
-local HudHealthDebug = { Enabled = false, LastState = nil, Timeline = {} }
-local PianoDebug = { Enabled = false, Timeline = {}, StartedAt = os.clock() }
-
 local RuntimeProfiler = {
     Enabled = false,
     Conn = nil,
@@ -422,26 +417,6 @@ local function getStunDebugOutput()
         "--- TIMELINE ---",
     }, "\n")
     return header .. "\n" .. table.concat(Dbg.StunTimeline, "\n")
-end
-
-local function pianoDebugLog(...)
-    if not PianoDebug.Enabled then return end
-    local values = { ... }
-    for index, value in ipairs(values) do values[index] = tostring(value) end
-    local line = string.format("+%.6f | [PIANO] %s", os.clock() - PianoDebug.StartedAt, table.concat(values, " "))
-    table.insert(PianoDebug.Timeline, line)
-    if #PianoDebug.Timeline > 500 then table.remove(PianoDebug.Timeline, 1) end
-    print(line)
-end
-
-local function getPianoDebugOutput()
-    local header = table.concat({
-        "BagahHub Gakuran Piano Test Debug",
-        "Copied: " .. os.date("!%Y-%m-%dT%H:%M:%SZ"),
-        "Remote: " .. tostring(InstrumentPianoRemote and InstrumentPianoRemote:GetFullName() or "nil"),
-        "--- TIMELINE ---",
-    }, "\n")
-    return header .. "\n" .. table.concat(PianoDebug.Timeline, "\n")
 end
 
 
@@ -790,39 +765,6 @@ function PianoTest.Stop()
     table.clear(PianoTest.ActiveNotes)
 end
 
-function PianoTest.StartSpy()
-    if PianoTest.SpyConn then return end
-    if not InstrumentPianoRemote then return end
-    PianoTest.SpyConn = InstrumentPianoRemote.OnClientEvent:Connect(function(...)
-        if not PianoDebug.Enabled then return end
-        local args = { ... }
-        local parts = {}
-        for i, arg in ipairs(args) do
-            local t = typeof(arg)
-            if t == "Instance" then
-                parts[i] = tostring(arg:GetFullName())
-            elseif t == "CFrame" then
-                parts[i] = "CFrame(" .. tostring(arg.Position) .. ")"
-            elseif t == "Vector3" then
-                parts[i] = "Vector3(" .. tostring(arg) .. ")"
-            elseif t == "table" then
-                parts[i] = "{" .. table.concat(arg, ",") .. "}"
-            else
-                parts[i] = tostring(arg)
-            end
-        end
-        pianoDebugLog("INCOMING:", table.concat(parts, " | "))
-    end)
-    pianoDebugLog("Remote spy started on", InstrumentPianoRemote:GetFullName())
-end
-
-function PianoTest.StopSpy()
-    if PianoTest.SpyConn then
-        PianoTest.SpyConn:Disconnect()
-        PianoTest.SpyConn = nil
-    end
-end
-
 function PianoTest.Play(luaText, songName)
     local function getPianoKeyButton(pianoIndex)
         local ok, button = pcall(function()
@@ -839,16 +781,16 @@ function PianoTest.Play(luaText, songName)
         pcall(function() inset = GuiService:GetGuiInset() end)
         local x, y = center.X + inset.X, center.Y + inset.Y
         if UserInputService.TouchEnabled then
-            VirtualInputManager:SendTouchEvent(pianoIndex, pressed and 0 or 2, x, y)
+            VirtualInputManager:SendTouchEvent(pianoIndex, pressed and 0 or 2, center.X, center.Y)
         else
-            VirtualInputManager:SendMouseButtonEvent(x, y, 0, pressed, game, 0)
+            local inset = Vector2.zero
+            pcall(function() inset = GuiService:GetGuiInset() end)
+            VirtualInputManager:SendMouseButtonEvent(center.X + inset.X, center.Y + inset.Y, 0, pressed, game, 0)
         end
         return true
     end
 
-    pianoDebugLog("playMidiString called:", songName or "unknown")
     local bpm = tonumber(luaText:match("bpm%s*=%s*([%d%.]+)"))
-    pianoDebugLog("Parsed BPM:", bpm)
     if not bpm or bpm <= 0 then
         notify("Piano", "No valid BPM found", 3)
         return
@@ -867,14 +809,12 @@ function PianoTest.Play(luaText, songName)
         end
     end
     if #chord > 0 then table.insert(events, { Notes = chord, Beats = 0.5 }) end
-    pianoDebugLog("Parsed events:", #events)
     if #events == 0 then
         notify("Piano", "No playable notes found", 3)
         return
     end
 
     local testButton = getPianoKeyButton(events[1].Notes[1])
-    pianoDebugLog("GUI key button found:", testButton ~= nil)
     if not testButton then
         notify("Piano", "Piano GUI not found - sit at a piano first", 3)
         return
@@ -883,7 +823,6 @@ function PianoTest.Play(luaText, songName)
     PianoTest.Stop()
     PianoTest.Playing = true
     local token = PianoTest.Token
-    pianoDebugLog("Starting GUI playback:", songName or "bundled")
     notify("Piano", "Playing: " .. (songName or "Bundled Test") .. " (" .. #events .. " events, BPM " .. bpm .. ")", 3)
     task.spawn(function()
         local beatDuration = 60 / bpm
@@ -898,14 +837,12 @@ function PianoTest.Play(luaText, songName)
 
         for i, event in ipairs(events) do
             if token ~= PianoTest.Token then
-                pianoDebugLog("Stopped at event", i)
                 break
             end
             local pressTime = startTime + accumulatedTime
             waitUntil(pressTime)
             if token ~= PianoTest.Token then break end
 
-            pianoDebugLog("Event", i, "notes:", table.concat(event.Notes, ","), "beats:", event.Beats)
             for noteIdx, pianoIndex in ipairs(event.Notes) do
                 pressPianoGuiKey(pianoIndex, true)
                 PianoTest.ActiveNotes[pianoIndex] = true
@@ -926,7 +863,6 @@ function PianoTest.Play(luaText, songName)
             accumulatedTime = accumulatedTime + holdTime
         end
         if token == PianoTest.Token then PianoTest.Playing = false end
-        pianoDebugLog("Playback finished")
     end)
 end
 
@@ -1409,7 +1345,7 @@ Library.Scheme.AccentColor = Color3.fromRGB(250, 204, 21)
 
 local ObsidianWindow = Library:CreateWindow({
     Title = "Bagah Hub - Gakuran",
-    Footer = "Bagah Hub | Gakuran v0.0.3",
+    Footer = "Bagah Hub | Gakuran v0.1.0",
     NotifySide = "Right",
     ShowCustomCursor = false,
 })
@@ -1418,24 +1354,6 @@ local controlIndex = 0
 local function nextControlIndex(prefix)
     controlIndex += 1
     return prefix .. controlIndex
-end
-
-local function getEspHealthDebugOutput()
-    return table.concat({
-        "BagahHub ESP Health Debug",
-        "Copied: " .. os.date("!%Y-%m-%dT%H:%M:%SZ"),
-        "--- TIMELINE ---",
-        table.concat(EspHealthDebug.Timeline, "\n"),
-    }, "\n")
-end
-
-local function getHudHealthDebugOutput()
-    return table.concat({
-        "BagahHub Player HUD Health Debug",
-        "Copied: " .. os.date("!%Y-%m-%dT%H:%M:%SZ"),
-        "--- TIMELINE ---",
-        table.concat(HudHealthDebug.Timeline, "\n"),
-    }, "\n")
 end
 
 local function titledControlIndex(prefix, title)
@@ -1784,15 +1702,6 @@ local function copyActiveDebugLogs()
     end
     if Rhythm.DebugEnabled then
         table.insert(reports, makeRhythmDebugReport())
-    end
-    if EspHealthDebug.Enabled then
-        table.insert(reports, getEspHealthDebugOutput())
-    end
-    if HudHealthDebug.Enabled then
-        table.insert(reports, getHudHealthDebugOutput())
-    end
-    if PianoDebug.Enabled then
-        table.insert(reports, getPianoDebugOutput())
     end
 
     if #reports == 0 then
@@ -3743,118 +3652,6 @@ if DEBUG_TAB_ENABLED then
         end
     })
 
-    DebugTab:Toggle({
-        Title = "ESP Health Debug",
-        Description = "Log ESP Humanoid cache, death, respawn, and health changes to the console",
-        Default = false,
-        Callback = function(value)
-            EspHealthDebug.Enabled = value
-            table.clear(EspHealthDebug.LastState)
-            if value then
-                table.clear(EspHealthDebug.Timeline)
-                table.insert(EspHealthDebug.Timeline,
-                    string.format("+%.6f | ESP health debug enabled; enable an ESP visual to begin tracking", os.clock()))
-            end
-        end
-    })
-
-    DebugTab:Toggle({
-        Title = "Player HUD Health Debug",
-        Description = "Log local Humanoid health and Player HUD updates across respawns",
-        Default = false,
-        Callback = function(value)
-            HudHealthDebug.Enabled = value
-            HudHealthDebug.LastState = nil
-            if value then
-                table.clear(HudHealthDebug.Timeline)
-                table.insert(HudHealthDebug.Timeline,
-                    string.format("+%.6f | Player HUD health debug enabled", os.clock()))
-            end
-        end
-    })
-
-    DebugTab:Toggle({
-        Title = "Piano Test Debug",
-        Description = "Log bundled MIDI piano test parsing, remote fires, incoming piano events, and timing",
-        Default = false,
-        Callback = function(value)
-            PianoDebug.Enabled = value
-            if value then
-                PianoDebug.StartedAt = os.clock()
-                table.clear(PianoDebug.Timeline)
-                pianoDebugLog("enabled", "remote=",
-                    InstrumentPianoRemote and InstrumentPianoRemote:GetFullName() or "nil")
-                PianoTest.StartSpy()
-            else
-                PianoTest.StopSpy()
-            end
-        end
-    })
-
-    DebugTab:Button({
-        Title = "Copy Piano Debug",
-        Description = "Copy piano test debug timeline to clipboard",
-        Callback = function()
-            local output = getPianoDebugOutput()
-            local ok = pcall(function() setclipboard(output) end)
-            if ok then
-                notify("Piano Debug", "Copied to clipboard", 2)
-            else
-                warn("[BagahHub PIANO DEBUG] Clipboard unavailable")
-            end
-        end
-    })
-
-    DebugTab:Button({
-        Title = "Dump Piano Keys",
-        Description = "Print all piano GUI key indices + keybind labels + note names (sit at piano first)",
-        Callback = function()
-            local ok, keysFolder = pcall(function()
-                return LocalPlayer.PlayerGui.PianoScreenGui.PianoGui.KeyboardArea.Keys
-            end)
-            if not ok or not keysFolder then
-                notify("Piano Debug", "Piano GUI not found - sit at a piano first", 3)
-                return
-            end
-            pianoDebugLog("=== PIANO KEY DUMP ===")
-            local entries = {}
-            for _, child in ipairs(keysFolder:GetChildren()) do
-                local idx = tonumber(child.Name)
-                if idx then
-                    local keybind = ""
-                    local noteName = ""
-                    local children = child:GetChildren()
-                    if children[5] and children[5]:FindFirstChild("TextLabel") then
-                        keybind = children[5].TextLabel.Text
-                    elseif children[5] and children[5].ClassName == "TextLabel" then
-                        keybind = children[5].Text
-                    end
-                    for _, sub in ipairs(children) do
-                        if sub:IsA("TextLabel") and sub.Text ~= keybind and #sub.Text > 0 then
-                            noteName = sub.Text
-                            break
-                        end
-                    end
-                    if child:FindFirstChild("TextLabel") and child.TextLabel.Text ~= keybind then
-                        noteName = child.TextLabel.Text
-                    end
-                    entries[idx] = { Key = keybind, Note = noteName }
-                end
-            end
-            local parts = {}
-            for i = 1, 61 do
-                local e = entries[i]
-                if e then
-                    table.insert(parts, string.format("%d=%s(%s)", i, e.Key, e.Note))
-                else
-                    table.insert(parts, string.format("%d=MISSING", i))
-                end
-            end
-            pianoDebugLog("Key dump:", table.concat(parts, " "))
-            notify("Piano Debug", "Key dump logged - press F8 to copy", 3)
-        end
-    })
-
     DebugTab:Button({
         Title = "Copy Latest Runtime Profile",
         Description = "Copy the latest 2-second runtime profiler report",
@@ -4003,20 +3800,6 @@ local function espClearHighlights()
     end
 end
 
-local function espHealthDebug(model, state, humanoid)
-    if not EspHealthDebug.Enabled then return end
-    local health = humanoid and humanoid.Health or -1
-    local maxHealth = humanoid and humanoid.MaxHealth or -1
-    local message = string.format("%s | health=%.1f/%.1f | humanoid=%s",
-        state, health, maxHealth, tostring(humanoid))
-    if EspHealthDebug.LastState[model] == message then return end
-    EspHealthDebug.LastState[model] = message
-    local line = string.format("+%.6f | %s | %s", os.clock(), model.Name, message)
-    table.insert(EspHealthDebug.Timeline, line)
-    if #EspHealthDebug.Timeline > 500 then table.remove(EspHealthDebug.Timeline, 1) end
-    print("[BagahHub ESP HEALTH]", line)
-end
-
 local function espGetCharacter(model)
     if not model or not model:IsA("Model") then return nil end
     if model == LocalPlayer.Character then return nil end
@@ -4025,10 +3808,8 @@ local function espGetCharacter(model)
     local cached = ESP.CharCache[model]
     if cached and cached.HRP.Parent == model and cached.Humanoid.Parent == model then
         if cached.Humanoid.Health > 0 then
-            espHealthDebug(model, "cached", cached.Humanoid)
             return cached
         end
-        espHealthDebug(model, "cached dead; clearing", cached.Humanoid)
         ESP.CharCache[model] = nil
     end
 
@@ -4041,14 +3822,12 @@ local function espGetCharacter(model)
     end
     local hrp = hum and hum.RootPart or model:FindFirstChild("HumanoidRootPart")
     if not hrp or not hum then
-        espHealthDebug(model, "no live humanoid", hum)
         ESP.CharCache[model] = nil
         return nil
     end
 
     local data = { Model = model, HRP = hrp, Humanoid = hum, Head = model:FindFirstChild("Head"), Name = model.Name }
     ESP.CharCache[model] = data
-    espHealthDebug(model, "resolved live humanoid", hum)
     return data
 end
 
@@ -4082,7 +3861,6 @@ local function espClearModel(model)
         end)
         ESP.Highlights[model] = nil
     end
-    EspHealthDebug.LastState[model] = nil
 end
 
 local function espHideModel(model)
@@ -4477,26 +4255,12 @@ local function hudRemoveBar(bar)
     end)
 end
 
-local function hudHealthDebug(state, humanoid)
-    if not HudHealthDebug.Enabled then return end
-    local message = string.format("%s | health=%.1f/%.1f | humanoid=%s",
-        state, humanoid and humanoid.Health or -1, humanoid and humanoid.MaxHealth or -1,
-        tostring(humanoid))
-    if HudHealthDebug.LastState == message then return end
-    HudHealthDebug.LastState = message
-    local line = string.format("+%.6f | %s", os.clock(), message)
-    table.insert(HudHealthDebug.Timeline, line)
-    if #HudHealthDebug.Timeline > 300 then table.remove(HudHealthDebug.Timeline, 1) end
-    print("[BagahHub HUD HEALTH]", line)
-end
-
 local function hudUpdateHealth()
     if not (HUD.ShowHealth and HUD.Objects.health) then return end
     local char = LocalPlayer.Character
     if not char then return end
     local hum = char:FindFirstChildOfClass("Humanoid")
     if not hum then return end
-    hudHealthDebug("render", hum)
     local hpPercent = math.floor((hum.Health / hum.MaxHealth) * 100)
     local color = hpPercent > 50 and Color3.fromRGB(80, 255, 80)
         or hpPercent > 25 and Color3.fromRGB(255, 200, 0)
@@ -4526,7 +4290,6 @@ local function startHud()
         if char then
             local hum = char:FindFirstChildOfClass("Humanoid")
             if hum then
-                hudHealthDebug("connected", hum)
                 hudUpdateHealth()
                 table.insert(HUD.Connections, hum:GetPropertyChangedSignal("Health"):Connect(hudUpdateHealth))
                 table.insert(HUD.Connections, hum:GetPropertyChangedSignal("MaxHealth"):Connect(hudUpdateHealth))
@@ -5185,17 +4948,6 @@ end
 MiscTab:Section({ Title = "Performance", TextSize = 20 })
 
 MiscTab:Toggle({
-    Title = "Auto Green Shoot",
-    Description = "Always Perfect basketball shoot by spoofing timing value",
-    Default = false,
-    Callback = function(value)
-        AutoGreenShoot = value
-        if value then hookNamecall() end
-        toggleAutoGreenMonitor(value)
-    end
-})
-
-MiscTab:Toggle({
     Title = "Anti Lag",
     Description = "Disable world effects, textures, lights, and water visuals. Restores them when disabled.",
     Flag = "AntiLag",
@@ -5214,6 +4966,17 @@ MiscTab:Toggle({
         else
             stopAntiAfk()
         end
+    end
+})
+
+MiscTab:Section({ Title = "Basketball", TextSize = 20 })
+
+MiscTab:Toggle({
+    Title = "Auto Green Shoot",
+    Description = "Auto release at Perfect timing when shooting basketball (hold F)",
+    Default = false,
+    Callback = function(value)
+        toggleAutoGreenMonitor(value)
     end
 })
 
