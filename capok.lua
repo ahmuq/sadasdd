@@ -838,7 +838,14 @@ function PianoTest.Play(luaText, songName)
             if token ~= PianoTest.Token then break end
 
             if PianoPlaybackDebug and i <= 10 then
-                local line = string.format("[PIANO] Evt%d | notes:%s", i, table.concat(event.Notes, ","))
+                local posInfo = {}
+                for _, pi in ipairs(event.Notes) do
+                    local btn = getPianoKeyButton(pi)
+                    local c = btn and (btn.AbsolutePosition + btn.AbsoluteSize / 2)
+                    table.insert(posInfo, string.format("%d@(%d,%d)", pi, c and c.X or 0, c and c.Y or 0))
+                end
+                local line = string.format("[PIANO] Evt%d | notes:%s | pos:%s", i,
+                    table.concat(event.Notes, ","), table.concat(posInfo, " "))
                 print(line)
                 table.insert(PianoPlaybackLog, line)
             end
