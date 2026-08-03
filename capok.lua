@@ -1576,6 +1576,7 @@ local Rhythm    = {
     -- ── Debug ─────────────────────────────────────────────────────────
     DebugEnabled = false,
     DebugTimeline = {},
+    AutoTimeline = {}, -- protected: auto-play events (HIT/TOUCH/SCAN) kept separate so the GUI inspector flood can't evict them
     DebugStartedAt = os.clock(),
     LastMissingRootDebug = 0,
     -- ── Internal state (moved from locals to save upvalue slots) ─────
@@ -1617,6 +1618,12 @@ local function rhythmDebug(tag, ...)
         os.clock() - Rhythm.DebugStartedAt, tag, table.concat(values, " "))
     table.insert(Rhythm.DebugTimeline, line)
     if #Rhythm.DebugTimeline > 800 then table.remove(Rhythm.DebugTimeline, 1) end
+    -- Auto-play events get a protected timeline so the GUI inspector flood
+    -- can't evict the evidence needed to diagnose misses.
+    if tag ~= "GUI INSPECT" then
+        table.insert(Rhythm.AutoTimeline, line)
+        if #Rhythm.AutoTimeline > 300 then table.remove(Rhythm.AutoTimeline, 1) end
+    end
 end
 
 local function makeRhythmDebugReport()
@@ -1635,6 +1642,29 @@ local function makeRhythmDebugReport()
         "TrackedNotes: " .. tostring(count),
         "ScrollSpeed: " .. tostring(Rhythm.ScrollSpeed),
         "SongTime: " .. tostring(Rhythm.SongTime),
+        "PressLeadMs: " .. tostring(Rhythm.PressLeadMs),
+        "--- TOUCH DIAGNOSTICS ---",
+        "TouchCorrection: " .. tostring(Rhythm.TouchCorrection),
+        "GuiInset: " .. (function()
+            local ok, inset = pcall(function() return GuiService:GetGuiInset() end)
+            return ok and tostring(inset) or "pcall failed"
+        end)(),
+        "ViewSize: " .. (function()
+            local ok, cam = pcall(function() return workspace.CurrentCamera end)
+            return ok and cam and tostring(cam.ViewportSize) or "none"
+        end)(),
+        "Receptors: " .. (function()
+            local parts = {}
+            for lane, receptor in ipairs(Rhythm.Receptors) do
+                local ok2 = pcall(function()
+                    parts[lane] = string.format("L%d(%d,%d %.0fx%.0f)", lane,
+                        receptor.AbsolutePosition.X, receptor.AbsolutePosition.Y,
+                        receptor.AbsoluteSize.X, receptor.AbsoluteSize.Y)
+                end)
+                if not ok2 then parts[lane] = "L" .. lane .. "=err" end
+            end
+            return #parts > 0 and table.concat(parts, " ") or "none"
+        end)(),
         "--- RATING SPY ---",
         "RatingSpy: " .. tostring(Rhythm.RatingSpy),
         "Total: " .. tostring(Rhythm.RatingTotal),
@@ -1646,7 +1676,9 @@ local function makeRhythmDebugReport()
         "Miss: " .. tostring(Rhythm.RatingCounts["Miss"] or 0),
         "--- CLOCK EVIDENCE ---",
         #Rhythm.ClockEvidence > 0 and table.concat(Rhythm.ClockEvidence, "\n") or "No clock candidates captured",
-        "--- TIMELINE ---",
+        "--- AUTO TIMELINE (auto-play events only, inspector excluded) ---",
+        #Rhythm.AutoTimeline > 0 and table.concat(Rhythm.AutoTimeline, "\n") or "No auto-play events captured",
+        "--- TIMELINE (inspector + all, can be flooded) ---",
         table.concat(Rhythm.DebugTimeline, "\n"),
     }, "\n")
 end
@@ -3732,6 +3764,7 @@ if DEBUG_TAB_ENABLED then
             Rhythm.DebugEnabled = value
             if value then
                 table.clear(Rhythm.DebugTimeline)
+                table.clear(Rhythm.AutoTimeline)
                 Rhythm.DebugStartedAt = os.clock()
                 rhythmDebug("DEBUG", "started")
                 rhythmScan()
