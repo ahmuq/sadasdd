@@ -779,10 +779,7 @@ function PianoTest.Play(luaText, songName)
         local button = getPianoKeyButton(pianoIndex)
         if not button then return false end
         local center = button.AbsolutePosition + button.AbsoluteSize / 2
-        local inset = Vector2.zero
-        pcall(function() inset = GuiService:GetGuiInset() end)
-        local x, y = center.X + inset.X, center.Y + inset.Y
-        VirtualInputManager:SendMouseButtonEvent(x, y, 0, pressed, game, 0)
+        VirtualInputManager:SendMouseButtonEvent(center.X, center.Y, 0, pressed, game, 0)
         return true
     end
 
