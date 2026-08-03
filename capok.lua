@@ -29,6 +29,7 @@ local SprintUpdateRemote    = RemotesFolder:FindFirstChild("SprintUpdate")
 local InstrumentPianoRemote = RemotesFolder:FindFirstChild("InstrumentPiano")
 local BasketballShootRemote = RemotesFolder:FindFirstChild("BasketballShoot")
 local PianoPlaybackDebug = false
+local PianoPlaybackLog = {}
 local toggleAutoGreenMonitor
 
 do
@@ -843,7 +844,9 @@ function PianoTest.Play(luaText, songName)
             if token ~= PianoTest.Token then break end
 
             if PianoPlaybackDebug and i <= 10 then
-                print(string.format("[PIANO] Evt%d | notes:%s", i, table.concat(event.Notes, ",")))
+                local line = string.format("[PIANO] Evt%d | notes:%s", i, table.concat(event.Notes, ","))
+                print(line)
+                table.insert(PianoPlaybackLog, line)
             end
 
             for noteIdx, pianoIndex in ipairs(event.Notes) do
@@ -3680,6 +3683,21 @@ if DEBUG_TAB_ENABLED then
         Default = false,
         Callback = function(value)
             PianoPlaybackDebug = value
+            if value then table.clear(PianoPlaybackLog) end
+        end
+    })
+
+    DebugTab:Button({
+        Title = "Copy Piano Playback Log",
+        Description = "Copy last piano playback debug log + upload to paste.rs",
+        Callback = function()
+            if #PianoPlaybackLog == 0 then
+                notify("Debug", "No piano playback log yet. Play a song first.", 2)
+                return
+            end
+            local output = "PIANO PLAYBACK LOG:\n" .. table.concat(PianoPlaybackLog, "\n")
+            uploadDebugLogs(output)
+            pcall(function() setclipboard(output) end)
         end
     })
 
