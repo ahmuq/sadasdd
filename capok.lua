@@ -779,13 +779,12 @@ function PianoTest.Play(luaText, songName)
         local button = getPianoKeyButton(pianoIndex)
         if not button then return false end
         local center = button.AbsolutePosition + button.AbsoluteSize / 2
-        local inset = Vector2.zero
-        pcall(function() inset = GuiService:GetGuiInset() end)
-        local x, y = center.X + inset.X, center.Y + inset.Y
         if UserInputService.TouchEnabled then
-            VirtualInputManager:SendTouchEvent(pianoIndex, pressed and 0 or 2, x, y)
+            VirtualInputManager:SendTouchEvent(pianoIndex, pressed and 0 or 2, center.X, center.Y)
         else
-            VirtualInputManager:SendMouseButtonEvent(x, y, 0, pressed, game, 0)
+            local inset = Vector2.zero
+            pcall(function() inset = GuiService:GetGuiInset() end)
+            VirtualInputManager:SendMouseButtonEvent(center.X + inset.X, center.Y + inset.Y, 0, pressed, game, 0)
         end
         return true
     end
