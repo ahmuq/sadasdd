@@ -1579,6 +1579,8 @@ local Rhythm    = {
     AutoTimeline = {}, -- protected: auto-play events (HIT/TOUCH/SCAN) kept separate so the GUI inspector flood can't evict them
     DebugStartedAt = os.clock(),
     LastMissingRootDebug = 0,
+    LastHeartbeat = 0,
+    LastStepErrorLog = 0,
     -- ── Internal state (moved from locals to save upvalue slots) ─────
     BuildId = "rhythm-notetime-20260802-6",
     Connections = {},
@@ -2680,7 +2682,11 @@ local function rhythmDebugStructure()
     rhythmDebug("UI", "service=", ui, "root=", root)
     if not root then return end
 
-    rhythmConfigure(root)
+    -- Read-only snapshot: never call rhythmConfigure from the debug path,
+    -- reconfiguring mid-play mutates receptors/keys/touch state and can
+    -- stop auto-play while debug is enabled.
+    rhythmDebug("STRUCTURE", "lanes=", Rhythm.LaneCount,
+        "keys=", Rhythm.Names and #Rhythm.Names > 0 and table.concat(Rhythm.Names, ",") or "none")
     local descendants = root:GetDescendants()
     rhythmDebug("STRUCTURE", "descendants=", #descendants)
     for index, object in ipairs(descendants) do
@@ -2971,8 +2977,7 @@ local function rhythmDeriveSongTime(noteTime, noteY, receptorY)
     return noteTime - timeToHit, timeToHit
 end
 
-local function rhythmStep()
-    if not Rhythm.Enabled then return end
+local function rhythmStepBody()
     local now = os.clock()
     local profileStartedAt = RuntimeProfiler.Enabled and now or nil
     if (not Rhythm.Root or not Rhythm.Root.Parent)
@@ -2983,7 +2988,15 @@ local function rhythmStep()
     if Rhythm.DebugEnabled and Rhythm.Root
         and Rhythm.DebugRootReported ~= Rhythm.Root then
         Rhythm.DebugRootReported = Rhythm.Root
-        rhythmDebugStructure()
+        -- Guarded: a failed structure dump must never abort the press logic.
+        pcall(rhythmDebugStructure)
+    end
+    if Rhythm.DebugEnabled and now - Rhythm.LastHeartbeat >= 2 then
+        Rhythm.LastHeartbeat = now
+        local tracked = 0
+        for _ in pairs(Rhythm.Active) do tracked += 1 end
+        rhythmDebug("HEARTBEAT", "tracked=", tracked, "root=", Rhythm.Root ~= nil,
+            "scroll=", Rhythm.ScrollSpeed ~= nil, "songTime=", Rhythm.SongTime ~= nil)
     end
 
     local songTimeVotes = Rhythm._songTimeVotes or {}
@@ -3113,6 +3126,25 @@ local function rhythmStep()
     if profileStartedAt then
         RuntimeProfiler.RhythmFrames += 1
         RuntimeProfiler.RhythmTime += os.clock() - profileStartedAt
+    end
+end
+
+-- Guard the frame loop: an error thrown while debug logging is active must
+-- never abort auto-play. Errors are throttled into the AUTO TIMELINE instead
+-- so the capture itself reveals what broke.
+local function rhythmStep()
+    if not Rhythm.Enabled then return end
+    local ok, err = pcall(rhythmStepBody)
+    if not ok then
+        if Rhythm.DebugEnabled then
+            local now = os.clock()
+            if now - Rhythm.LastStepErrorLog >= 1 then
+                Rhythm.LastStepErrorLog = now
+                rhythmDebug("STEP ERROR", tostring(err))
+            end
+        else
+            error(err, 0)
+        end
     end
 end
 
@@ -3795,10 +3827,12 @@ if DEBUG_TAB_ENABLED then
                 rhythmDebug("DEBUG", "started")
                 -- Run the structural scans asynchronously so enabling debug
                 -- doesn't stall the frame loop and break auto-play timing.
+                -- Each scan is guarded so a failed dump can never affect
+                -- the running auto-play.
                 task.spawn(function()
-                    rhythmScan()
-                    rhythmDebugStructure()
-                    rhythmDebugAndroidHierarchy()
+                    pcall(rhythmScan)
+                    pcall(rhythmDebugStructure)
+                    pcall(rhythmDebugAndroidHierarchy)
                 end)
             end
         end
