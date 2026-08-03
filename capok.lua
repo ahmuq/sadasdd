@@ -2866,7 +2866,10 @@ local function rhythmDebugAndroidHierarchy()
     end
 
     local matched = 0
-    for _, object in ipairs(descendants) do
+    for i, object in ipairs(descendants) do
+        -- Yield periodically so this large hierarchy scan doesn't stall the
+        -- frame loop (which makes timing-sensitive auto-play miss notes).
+        if i % 250 == 0 then task.wait() end
         local lowerName = object.Name:lower()
         local relevantName = lowerName:find("rhythm", 1, true)
             or lowerName:find("note", 1, true)
@@ -3790,9 +3793,13 @@ if DEBUG_TAB_ENABLED then
                 table.clear(Rhythm.AutoTimeline)
                 Rhythm.DebugStartedAt = os.clock()
                 rhythmDebug("DEBUG", "started")
-                rhythmScan()
-                rhythmDebugStructure()
-                rhythmDebugAndroidHierarchy()
+                -- Run the structural scans asynchronously so enabling debug
+                -- doesn't stall the frame loop and break auto-play timing.
+                task.spawn(function()
+                    rhythmScan()
+                    rhythmDebugStructure()
+                    rhythmDebugAndroidHierarchy()
+                end)
             end
         end
     })
