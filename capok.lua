@@ -794,8 +794,12 @@ function PianoTest.Play(luaText, songName)
         local needsShift = isBlackKey
         if pressed then
             if needsShift then
-                -- Shift selects the black key on InputBegan; keeping it held would corrupt overlapping white notes.
+                -- Clear a stale modifier before selecting a black key.
+                VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.LeftShift, false, game)
                 VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.LeftShift, false, game)
+            else
+                -- The game occasionally retains virtual Shift after a black key; white notes must reset it first.
+                VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.LeftShift, false, game)
             end
             VirtualInputManager:SendKeyEvent(true, keyCode, false, game)
             if needsShift then
