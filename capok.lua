@@ -3724,7 +3724,7 @@ if DEBUG_TAB_ENABLED then
                             if keybind == "" then keybind = sub.Text else noteName = sub.Text end
                         end
                     end
-                    entries[idx] = { Key = keybind, Note = noteName }
+                    entries[idx] = { Key = keybind, Note = noteName, Pos = child.AbsolutePosition, Size = child.AbsoluteSize }
                 end
             end
             local parts = {}
@@ -3736,7 +3736,15 @@ if DEBUG_TAB_ENABLED then
                     table.insert(parts, string.format("%d=MISSING", i))
                 end
             end
+            local posParts = { "PIANO KEY POSITIONS:" }
+            for i = 1, 61 do
+                local e = entries[i]
+                if e then
+                    table.insert(posParts, string.format("%d:AbsPos(%.0f,%.0f) Size(%.0f,%.0f)", i, e.Pos.X, e.Pos.Y, e.Size.X, e.Size.Y))
+                end
+            end
             local output = "PIANO KEY DUMP:\n" .. table.concat(parts, " ")
+                .. "\n\n" .. table.concat(posParts, "\n")
             print(output)
             uploadDebugLogs(output)
         end
