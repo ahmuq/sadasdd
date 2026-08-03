@@ -3669,6 +3669,47 @@ if DEBUG_TAB_ENABLED then
         Callback = copyActiveDebugLogs
     })
 
+    DebugTab:Button({
+        Title = "Dump Piano Keys",
+        Description = "Print all piano GUI key indices + keybind labels + note names (sit at piano first)",
+        Callback = function()
+            local ok, keysFolder = pcall(function()
+                return LocalPlayer.PlayerGui.PianoScreenGui.PianoGui.KeyboardArea.Keys
+            end)
+            if not ok or not keysFolder then
+                notify("Debug", "Piano GUI not found - sit at a piano first", 3)
+                return
+            end
+            local entries = {}
+            for _, child in ipairs(keysFolder:GetChildren()) do
+                local idx = tonumber(child.Name)
+                if idx then
+                    local keybind = ""
+                    local noteName = ""
+                    local children = child:GetChildren()
+                    for _, sub in ipairs(children) do
+                        if sub:IsA("TextLabel") and sub.Text ~= "" and #sub.Text <= 4 then
+                            if keybind == "" then keybind = sub.Text else noteName = sub.Text end
+                        end
+                    end
+                    entries[idx] = { Key = keybind, Note = noteName }
+                end
+            end
+            local parts = {}
+            for i = 1, 61 do
+                local e = entries[i]
+                if e then
+                    table.insert(parts, string.format("%d=%s(%s)", i, e.Key, e.Note))
+                else
+                    table.insert(parts, string.format("%d=MISSING", i))
+                end
+            end
+            local output = "PIANO KEY DUMP:\n" .. table.concat(parts, " ")
+            print(output)
+            uploadDebugLogs(output)
+        end
+    })
+
     DebugTab:Divider()
 
     DebugTab:Toggle({
