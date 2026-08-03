@@ -776,17 +776,39 @@ function PianoTest.Play(luaText, songName)
     local function pressPianoGuiKey(pianoIndex, pressed)
         local button = getPianoKeyButton(pianoIndex)
         if not button then return false end
+
+        local keyLabel = ""
+        for _, child in ipairs(button:GetChildren()) do
+            if child:IsA("TextLabel") and child.Text ~= "" and #child.Text == 1 then
+                keyLabel = child.Text
+                break
+            end
+        end
+
+        if keyLabel ~= "" then
+            local keyCode = nil
+            local digitNames = {
+                ["0"] = "Zero", ["1"] = "One", ["2"] = "Two",
+                ["3"] = "Three", ["4"] = "Four", ["5"] = "Five",
+                ["6"] = "Six", ["7"] = "Seven", ["8"] = "Eight",
+                ["9"] = "Nine",
+            }
+            local lookupKey = keyLabel:upper()
+            if digitNames[lookupKey] then
+                lookupKey = digitNames[lookupKey]
+            end
+            keyCode = Enum.KeyCode[lookupKey]
+            if keyCode then
+                VirtualInputManager:SendKeyEvent(pressed, keyCode, false, game)
+                return true
+            end
+        end
+
         local center = button.AbsolutePosition + button.AbsoluteSize / 2
         local inset = Vector2.zero
         pcall(function() inset = GuiService:GetGuiInset() end)
         local x, y = center.X + inset.X, center.Y + inset.Y
-        if UserInputService.TouchEnabled then
-            VirtualInputManager:SendTouchEvent(pianoIndex, pressed and 0 or 2, center.X, center.Y)
-        else
-            local inset = Vector2.zero
-            pcall(function() inset = GuiService:GetGuiInset() end)
-            VirtualInputManager:SendMouseButtonEvent(center.X + inset.X, center.Y + inset.Y, 0, pressed, game, 0)
-        end
+        VirtualInputManager:SendMouseEvent(0, pressed and 0 or 1, 0, x, y)
         return true
     end
 
