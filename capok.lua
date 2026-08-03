@@ -780,6 +780,7 @@ function PianoTest.Play(luaText, songName)
         if not button then return false end
         local center = button.AbsolutePosition + button.AbsoluteSize / 2
         VirtualInputManager:SendMouseButtonEvent(center.X, center.Y, 0, pressed, game, 0)
+        VirtualInputManager:SendTouchEvent(pianoIndex, pressed and 0 or 2, center.X, center.Y)
         return true
     end
 
