@@ -28,6 +28,7 @@ local SprintRemote          = RemotesFolder:FindFirstChild("Sprint")
 local SprintUpdateRemote    = RemotesFolder:FindFirstChild("SprintUpdate")
 local InstrumentPianoRemote = RemotesFolder:FindFirstChild("InstrumentPiano")
 local BasketballShootRemote = RemotesFolder:FindFirstChild("BasketballShoot")
+local PianoPlaybackDebug = false
 local toggleAutoGreenMonitor
 
 do
@@ -840,6 +841,10 @@ function PianoTest.Play(luaText, songName)
             local pressTime = startTime + accumulatedTime
             waitUntil(pressTime)
             if token ~= PianoTest.Token then break end
+
+            if PianoPlaybackDebug and i <= 10 then
+                print(string.format("[PIANO] Evt%d | notes:%s", i, table.concat(event.Notes, ",")))
+            end
 
             for noteIdx, pianoIndex in ipairs(event.Notes) do
                 pressPianoGuiKey(pianoIndex, true)
@@ -3667,6 +3672,15 @@ if DEBUG_TAB_ENABLED then
         Title = "Copy Active Debug Logs",
         Description = "Copy whichever debug logs are currently enabled (same as F8)",
         Callback = copyActiveDebugLogs
+    })
+
+    DebugTab:Toggle({
+        Title = "Piano Playback Debug",
+        Description = "Print first 10 note indices to console when playing piano",
+        Default = false,
+        Callback = function(value)
+            PianoPlaybackDebug = value
+        end
     })
 
     DebugTab:Button({
