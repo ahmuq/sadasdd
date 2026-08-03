@@ -724,7 +724,7 @@ local notify
 -- ========================================================================= --
 --                         BUNDLED MIDI PIANO TEST                           --
 -- ========================================================================= --
-local PianoTest = { Token = 0, Playing = false, KeyToIndex = {}, ActiveNotes = {} }
+local PianoTest = { Token = 0, Playing = false, KeyToIndex = {}, BlackIndices = {}, ActiveNotes = {}, PressedKeys = {} }
 
 do
     local whiteKeys = { "1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "q", "w", "e", "r", "t", "y", "u", "i", "o",
@@ -738,6 +738,7 @@ do
         if blackAfter[keyIndex] then
             index += 1
             PianoTest.KeyToIndex[blackAfter[keyIndex]] = index
+            PianoTest.BlackIndices[index] = true
         end
     end
 end
@@ -746,22 +747,12 @@ end
 function PianoTest.Stop()
     PianoTest.Token += 1
     PianoTest.Playing = false
-    for pianoIndex in pairs(PianoTest.ActiveNotes) do
+    for _, state in pairs(PianoTest.PressedKeys) do
         pcall(function()
-            local button = LocalPlayer.PlayerGui.PianoScreenGui.PianoGui.KeyboardArea.Keys[tostring(pianoIndex)]
-            if button then
-                local center = button.AbsolutePosition + button.AbsoluteSize / 2
-                local inset = Vector2.zero
-                pcall(function() inset = GuiService:GetGuiInset() end)
-                local x, y = center.X + inset.X, center.Y + inset.Y
-                if UserInputService.TouchEnabled then
-                    VirtualInputManager:SendTouchEvent(pianoIndex, 2, x, y)
-                else
-                    VirtualInputManager:SendMouseButtonEvent(x, y, 0, false, game, 0)
-                end
-            end
+            VirtualInputManager:SendKeyEvent(false, state.KeyCode, false, game)
         end)
     end
+    table.clear(PianoTest.PressedKeys)
     table.clear(PianoTest.ActiveNotes)
 end
 
@@ -777,6 +768,7 @@ function PianoTest.Play(luaText, songName)
         local button = getPianoKeyButton(pianoIndex)
         if not button then return false end
 
+        local isBlackKey = PianoTest.BlackIndices[pianoIndex] == true
         local keyLabel = ""
         for _, child in ipairs(button:GetChildren()) do
             if child:IsA("TextLabel") and child.Text ~= "" and #child.Text == 1 then
@@ -785,30 +777,37 @@ function PianoTest.Play(luaText, songName)
             end
         end
 
-        if keyLabel ~= "" then
-            local keyCode = nil
-            local digitNames = {
-                ["0"] = "Zero", ["1"] = "One", ["2"] = "Two",
-                ["3"] = "Three", ["4"] = "Four", ["5"] = "Five",
-                ["6"] = "Six", ["7"] = "Seven", ["8"] = "Eight",
-                ["9"] = "Nine",
-            }
-            local lookupKey = keyLabel:upper()
-            if digitNames[lookupKey] then
-                lookupKey = digitNames[lookupKey]
-            end
-            keyCode = Enum.KeyCode[lookupKey]
-            if keyCode then
-                VirtualInputManager:SendKeyEvent(pressed, keyCode, false, game)
-                return true
-            end
-        end
+        local digitNames = {
+            ["0"] = "Zero", ["1"] = "One", ["2"] = "Two",
+            ["3"] = "Three", ["4"] = "Four", ["5"] = "Five",
+            ["6"] = "Six", ["7"] = "Seven", ["8"] = "Eight",
+            ["9"] = "Nine",
+        }
+        local shiftedDigits = {
+            ["!"] = "One", ["@"] = "Two", ["#"] = "Three", ["$"] = "Four", ["%"] = "Five",
+            ["^"] = "Six", ["&"] = "Seven", ["*"] = "Eight", ["("] = "Nine", [")"] = "Zero",
+        }
+        local lookupKey = shiftedDigits[keyLabel] or digitNames[keyLabel] or keyLabel:upper()
+        local keyCode = Enum.KeyCode[lookupKey]
+        if not keyCode then return false end
 
-        local center = button.AbsolutePosition + button.AbsoluteSize / 2
-        local inset = Vector2.zero
-        pcall(function() inset = GuiService:GetGuiInset() end)
-        local x, y = center.X + inset.X, center.Y + inset.Y
-        VirtualInputManager:SendMouseEvent(0, pressed and 0 or 1, 0, x, y)
+        local needsShift = isBlackKey
+        if pressed then
+            if needsShift then
+                -- Shift selects the black key on InputBegan; keeping it held would corrupt overlapping white notes.
+                VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.LeftShift, false, game)
+            end
+            VirtualInputManager:SendKeyEvent(true, keyCode, false, game)
+            if needsShift then
+                VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.LeftShift, false, game)
+            end
+            PianoTest.PressedKeys[pianoIndex] = { KeyCode = keyCode }
+        else
+            local state = PianoTest.PressedKeys[pianoIndex]
+            if not state then return false end
+            VirtualInputManager:SendKeyEvent(false, state.KeyCode, false, game)
+            PianoTest.PressedKeys[pianoIndex] = nil
+        end
         return true
     end
 
@@ -818,25 +817,30 @@ function PianoTest.Play(luaText, songName)
         return
     end
 
-    local events, chord = {}, {}
+    local actions, beatCursor = {}, 0
     for line in luaText:gmatch("[^\r\n]+") do
-        local key = line:match('keypress%(["\'](.)["\']')
-        if key and PianoTest.KeyToIndex[key] then
-            table.insert(chord, PianoTest.KeyToIndex[key])
+        local key, duration = line:match('keypress%s*%(%s*["\'](.)["\']%s*,%s*([%d%.]+)')
+        local noteDuration = tonumber(duration)
+        if key and noteDuration and noteDuration > 0 and PianoTest.KeyToIndex[key] then
+            local pianoIndex = PianoTest.KeyToIndex[key]
+            table.insert(actions, { Time = beatCursor, Index = pianoIndex, Pressed = true })
+            table.insert(actions, { Time = beatCursor + noteDuration, Index = pianoIndex, Pressed = false })
         end
         local beats = tonumber(line:match("rest%(([%d%.]+)"))
-        if beats and #chord > 0 then
-            table.insert(events, { Notes = chord, Beats = beats })
-            chord = {}
-        end
+        if beats and beats > 0 then beatCursor += beats end
     end
-    if #chord > 0 then table.insert(events, { Notes = chord, Beats = 0.5 }) end
-    if #events == 0 then
+    if #actions == 0 then
         notify("Piano", "No playable notes found", 3)
         return
     end
 
-    local testButton = getPianoKeyButton(events[1].Notes[1])
+    -- Release before a new press at the same instant so repeated notes retrigger correctly.
+    table.sort(actions, function(a, b)
+        if a.Time == b.Time then return not a.Pressed and b.Pressed end
+        return a.Time < b.Time
+    end)
+
+    local testButton = getPianoKeyButton(actions[1].Index)
     if not testButton then
         notify("Piano", "Piano GUI not found - sit at a piano first", 3)
         return
@@ -845,44 +849,35 @@ function PianoTest.Play(luaText, songName)
     PianoTest.Stop()
     PianoTest.Playing = true
     local token = PianoTest.Token
-    notify("Piano", "Playing: " .. (songName or "Bundled Test") .. " (" .. #events .. " events, BPM " .. bpm .. ")", 3)
+    notify("Piano", "Playing: " .. (songName or "Bundled Test") .. " (" .. (#actions / 2) .. " notes, BPM " .. bpm .. ")", 3)
     task.spawn(function()
         local beatDuration = 60 / bpm
         local startTime = os.clock()
-        local accumulatedTime = 0
-
         local function waitUntil(targetTime)
             while token == PianoTest.Token and os.clock() < targetTime do
                 task.wait(math.min(targetTime - os.clock(), 0.005))
             end
         end
 
-        for i, event in ipairs(events) do
+        for _, action in ipairs(actions) do
             if token ~= PianoTest.Token then
                 break
             end
-            local pressTime = startTime + accumulatedTime
-            waitUntil(pressTime)
+            waitUntil(startTime + action.Time * beatDuration)
             if token ~= PianoTest.Token then break end
 
-            for noteIdx, pianoIndex in ipairs(event.Notes) do
-                pressPianoGuiKey(pianoIndex, true)
-                PianoTest.ActiveNotes[pianoIndex] = true
-                if noteIdx < #event.Notes then task.wait(0.03) end
+            local activeCount = PianoTest.ActiveNotes[action.Index] or 0
+            if action.Pressed then
+                if activeCount == 0 then
+                    pressPianoGuiKey(action.Index, true)
+                end
+                PianoTest.ActiveNotes[action.Index] = activeCount + 1
+            elseif activeCount <= 1 then
+                pressPianoGuiKey(action.Index, false)
+                PianoTest.ActiveNotes[action.Index] = nil
+            else
+                PianoTest.ActiveNotes[action.Index] = activeCount - 1
             end
-
-            local holdTime = event.Beats * beatDuration
-            local releaseTime = pressTime + holdTime
-            waitUntil(releaseTime)
-            if token ~= PianoTest.Token then break end
-
-            for noteIdx, pianoIndex in ipairs(event.Notes) do
-                pressPianoGuiKey(pianoIndex, false)
-                PianoTest.ActiveNotes[pianoIndex] = nil
-                if noteIdx < #event.Notes then task.wait(0.015) end
-            end
-
-            accumulatedTime = accumulatedTime + holdTime
         end
         if token == PianoTest.Token then PianoTest.Playing = false end
     end)
